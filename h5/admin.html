@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#ffa000">
+<title>猩球 · 羽球局 后台</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app">
+  <header id="topbar" class="topbar"></header>
+  <main id="view" class="view"></main>
+  <nav class="tabbar" style="position:static;border-top:1px solid var(--border)">
+    <a href="admin.html" style="text-align:left;padding-left:16px">⚙ 后台管理</a>
+    <a href="index.html" style="text-align:right;padding-right:16px">返回前台 →</a>
+  </nav>
+</div>
+<div id="modal" class="modal-mask" hidden>
+  <div class="modal"><p id="modal-text"></p><div id="modal-actions" class="modal-actions"></div></div>
+</div>
+<script src="../shared/rules.js"></script>
+<script src="../shared/formats.js"></script>
+<script src="../shared/plays/index.js"></script>
+<script src="js/api.js"></script>
+<script src="js/store.js"></script>
+<script src="js/admin.js"></script>
+</body>
+</html>

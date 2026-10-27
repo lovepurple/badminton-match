@@ -94,7 +94,7 @@ draft ──open──▶ open ──start──▶ playing ──finish──�
 ### 场馆与导航
 
 - 数据：`server/app/db.py` 的 `venues` 表；接口在 `main.py`（写操作 `require_admin`）。
-- 页面：`h5/js/app.js` 的 `renderVenues()`；导航封装在 `h5/js/nav.js`。
+- 页面：独立后台 `h5/admin.html` + `h5/js/admin.js`（与前台分离，非管理员拦截）。
 - 管理员：`GORILLA_ADMIN_DEVICES` 命中，或库里没有管理员时首个登录用户。
 
 ### 微信登录
