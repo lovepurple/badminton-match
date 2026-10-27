@@ -307,6 +307,10 @@
     return call('/api/venues/' + id, { method: 'DELETE' });
   }
 
+  async function claimAdmin(code) {
+    return call('/api/auth/admin-claim', { method: "POST", data: { code } });
+  }
+
   async function formatOverrides() {
     return call('/api/formats');
   }
@@ -356,6 +360,7 @@
     updateRace,
     updateMatch,
     removeRace,
+    claimAdmin,
     formatOverrides,
     saveFormat,
     resetFormat,

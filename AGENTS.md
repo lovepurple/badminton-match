@@ -94,7 +94,8 @@ draft ──open──▶ open ──start──▶ playing ──finish──�
 ### 场馆与导航
 
 - 数据：`server/app/db.py` 的 `venues` 表；接口在 `main.py`（写操作 `require_admin`）。
-- 页面：独立后台 `h5/admin.html` + `h5/js/admin.js`（与前台分离，非管理员拦截）。
+- 页面：独立后台 `h5/admin.html` + `h5/js/admin.js` + `h5/admin.css`（桌面优先、宽屏两列，窄屏单列）。
+- 非管理员进入后台时显示口令框，调 `POST /api/auth/admin-claim`（`GORILLA_ADMIN_CODE`）提升角色。
 - 管理员：`GORILLA_ADMIN_DEVICES` 命中，或库里没有管理员时首个登录用户。
 
 ### 微信登录

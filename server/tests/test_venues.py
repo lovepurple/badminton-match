@@ -104,3 +104,27 @@ def test_race_keeps_date_and_venue_snapshot():
         info = client.get("/api/join/" + code, headers=admin).json()
         assert info["race"]["date"] == "2026-11-01T19:00"
         assert info["race"]["venue"]["address"] == venue["address"]
+
+
+def test_admin_claim_with_code(monkeypatch):
+    monkeypatch.setattr(__import__("app.main", fromlist=["main"]), "ADMIN_CODE", "secret268")
+    with TestClient(app) as client:
+        _, guest = login(client, "claim-guest")
+        assert client.get("/api/me", headers=guest).json()["role"] == "user"
+
+        # 口令错误
+        bad = client.post("/api/auth/admin-claim", json={"code": "nope"}, headers=guest)
+        assert bad.status_code == 403
+
+        ok = client.post("/api/auth/admin-claim", json={"code": "secret268"}, headers=guest)
+        assert ok.status_code == 200
+        assert client.get("/api/me", headers=guest).json()["role"] == "admin"
+
+
+def test_admin_claim_disabled_without_code(monkeypatch):
+    monkeypatch.setattr(__import__("app.main", fromlist=["main"]), "ADMIN_CODE", "")
+    with TestClient(app) as client:
+        _, guest = login(client, "claim-guest-2")
+        res = client.post("/api/auth/admin-claim", json={"code": "whatever"}, headers=guest)
+        assert res.status_code == 403
+        assert "未配置" in res.json()["detail"]

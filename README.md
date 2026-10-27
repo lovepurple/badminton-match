@@ -47,7 +47,8 @@ cd server && python -m pytest -q
 ## 管理员
 
 首个登录的用户自动成为管理员；也可用 `GORILLA_ADMIN_DEVICES=deviceA,deviceB` 指定。
-管理员在首页右上角「后台」进入独立后台页 `h5/admin.html`（玩法 + 场馆），非管理员访问会被拦截。
+管理员在首页右上角「后台」进入独立后台页 `h5/admin.html`（玩法 + 场馆），非管理员会被拦截并提示输入**管理员口令**
+（服务端 `GORILLA_ADMIN_CODE`，验证一次永久生效）。后台是桌面优先布局，宽屏两列、窄屏自动单列。
 
 ## 一条完整的使用流程
 

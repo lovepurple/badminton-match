@@ -114,6 +114,7 @@ Base：`http://<host>:18000`（端口可改）。除 `POST /api/auth/login` 与 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/me` | 当前用户（`role`: `admin` / `user`） |
+| POST | `/api/auth/admin-claim` | 输入管理员口令把自己提升为管理员（`GORILLA_ADMIN_CODE`） |
 | GET | `/api/venues` | 场馆列表（所有登录用户可读；空库时自动种入默认场馆） |
 | POST | `/api/venues` | 新增场馆（管理员） |
 | PUT | `/api/venues/{id}` | 修改场馆（管理员） |

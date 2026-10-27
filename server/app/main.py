@@ -40,6 +40,7 @@ WECHAT_SECRET = os.environ.get("GORILLA_WECHAT_SECRET", "")
 OAUTH_CALLBACK = os.environ.get("GORILLA_OAUTH_CALLBACK", "")
 PUBLIC_BASE = os.environ.get("GORILLA_PUBLIC_BASE", "")
 ADMIN_DEVICES = {d.strip() for d in os.environ.get("GORILLA_ADMIN_DEVICES", "").split(",") if d.strip()}
+ADMIN_CODE = os.environ.get("GORILLA_ADMIN_CODE", "")
 
 # 网页授权 state -> 回跳地址（单进程内存，重启失效；生产可换 Redis）
 OAUTH_STATES: dict[str, tuple[str, int]] = {}
@@ -92,6 +93,10 @@ class Match(BaseModel):
     scores: list[list[int]] = Field(default_factory=list)
     scoreAll: list[int] | None = None
     status: str = "pending"
+
+
+class AdminClaimIn(BaseModel):
+    code: str
 
 
 class VenueIn(BaseModel):
@@ -278,6 +283,17 @@ def login(body: LoginIn) -> dict:
         "token": token,
         "user": {"id": user_id, "nickname": body.nickname or "", "role": user.get("role", "user")},
     }
+
+
+@app.post("/api/auth/admin-claim")
+def claim_admin(body: AdminClaimIn, user_id: str = Depends(current_user)) -> dict:
+    """输入管理员口令后把当前用户提升为管理员（内部使用免去配置 deviceId）。"""
+    if not ADMIN_CODE:
+        raise HTTPException(status_code=403, detail="服务端未配置管理员口令（GORILLA_ADMIN_CODE）")
+    if not secrets.compare_digest(body.code.strip(), ADMIN_CODE):
+        raise HTTPException(status_code=403, detail="口令错误")
+    db.set_role(user_id, "admin")
+    return {"role": "admin"}
 
 
 @app.get("/api/me")

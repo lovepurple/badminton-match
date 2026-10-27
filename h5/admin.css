@@ -1,0 +1,86 @@
+/*
+ * 后台页样式：桌面优先（管理员通常在 PC 上操作），小屏自动降级为单列。
+ * 只被 admin.html 引用，不影响前台。
+ */
+
+/* 桌面基准（默认） */
+#app {
+  max-width: 1080px;
+}
+
+.topbar {
+  min-height: 56px;
+  padding: 12px 24px;
+  font-size: 18px;
+}
+
+.topbar .action {
+  padding: 8px 20px;
+  font-size: 15px;
+}
+
+.view {
+  padding: 24px 32px 60px;
+}
+
+.admin-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.admin-tabs button {
+  padding: 10px 28px;
+  border: 0;
+  border-radius: 999px;
+  background: #fff;
+  color: var(--muted);
+  font-size: 15px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+}
+
+.admin-tabs button.on {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  border-color: var(--accent);
+}
+
+.card {
+  padding: 20px 22px;
+}
+
+.card h3 {
+  font-size: 17px;
+}
+
+.rule-row {
+  font-size: 14px;
+}
+
+/* 玩法列表：宽屏两列 */
+@media (min-width: 860px) {
+  .admin-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    align-items: start;
+  }
+
+  .admin-grid .card {
+    margin-bottom: 0;
+  }
+}
+
+/* 让「继续维护桶」「玩法/场馆切换」在宽屏下跟正文统一留白 */
+.tabs {
+  max-width: 300px;
+}
+
+/* 小屏（手机上开后台）降级为窄布局 */
+@media (max-width: 640px) {
+  .view {
+    padding: 14px 12px 60px;
+  }
+}

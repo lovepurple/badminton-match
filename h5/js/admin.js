@@ -140,9 +140,9 @@
 
   function tabBar() {
     return (
-      '<div class="tabs">' +
-      '<button data-atab="formats" class="' + (tab === "formats" ? "on" : "") + '">玩法</button>' +
-      '<button data-atab="venues" class="' + (tab === "venues" ? "on" : "") + '">场馆</button>' +
+      '<div class="admin-tabs">' +
+      '<button data-atab="formats" class="' + (tab === "formats" ? "on" : "") + '">玩法管理</button>' +
+      '<button data-atab="venues" class="' + (tab === "venues" ? "on" : "") + '">场馆管理</button>' +
       "</div>"
     );
   }
@@ -158,7 +158,7 @@
       '<div class="hint" style="margin-bottom:12px">玩法由代码实现（shared/plays/*.js）；' +
       "这里调整展示文案、默认规则与启用状态。新增玩法点「新增玩法」把提示词交给 LLM。</div>";
 
-    html += PLAYS.map((play) => {
+    html += '<div class="admin-grid">' + PLAYS.map((play) => {
       const badges =
         '<span class="badge">' + esc(play.group) + "</span>" +
         (play.enabled === false ? ' <span class="badge">已停用</span>' : "") +
@@ -178,7 +178,7 @@
           : "") +
         "</div></div>"
       );
-    }).join("");
+    }).join("") + "</div>";
 
     if (draftPlay) {
       const d = draftPlay;
@@ -431,6 +431,8 @@
   }
 
   async function render() {
+    const want = location.hash.replace("#", "");
+    if (want === "venues" || want === "formats") tab = want;
     if (tab === "venues") return renderVenues();
     return renderFormats();
   }
@@ -454,7 +456,29 @@
     if (role !== "admin") {
       view.innerHTML =
         '<div class="empty">需要管理员权限<br><br>' +
-        '<a href="index.html" style="color:var(--accent-dark)">返回前台</a></div>';
+        '<div style="max-width:320px;margin:0 auto">' +
+        '<div class="field"><label>管理员口令</label>' +
+        '<input type="password" id="admin-code" placeholder="向服务器管理员要口令"></div>' +
+        '<button class="btn" id="claim-admin">验证并进入</button>' +
+        '<div class="hint">口令由服务端配置（GORILLA_ADMIN_CODE），验证一次永久生效。</div>' +
+        '</div></div>';
+      const claim = view.querySelector("#claim-admin");
+      claim.onclick = async () => {
+        const code = view.querySelector("#admin-code").value.trim();
+        if (!code) return;
+        try {
+          const res = await S.claimAdmin(code);
+          if (res && res.role === "admin") {
+            role = "admin";
+            myRole = "admin";
+            if (BA.plays && BA.plays.ready) await BA.plays.ready;
+            await loadPlays();
+            render();
+          }
+        } catch (e) {
+          modal((e && e.detail) || "验证失败");
+        }
+      };
       return;
     }
     if (BA.plays && BA.plays.ready) {
@@ -466,5 +490,6 @@
     }
     await loadPlays();
     render();
+    global.addEventListener("hashchange", () => render());
   })();
 })(window);
