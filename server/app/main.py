@@ -33,7 +33,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import db, rules
+from . import amap, db, rules
 
 WECHAT_APPID = os.environ.get("GORILLA_WECHAT_APPID", "")
 WECHAT_SECRET = os.environ.get("GORILLA_WECHAT_SECRET", "")
@@ -116,6 +116,10 @@ class FormatOverrideIn(BaseModel):
     defaults: dict | None = None
     rules: dict | None = None
     note: str = ""
+
+
+class ResolveIn(BaseModel):
+    url: str
 
 
 class OpenIn(BaseModel):
@@ -230,6 +234,7 @@ def health() -> dict:
         "features": {
             "wechatOAuth": bool(WECHAT_APPID and WECHAT_SECRET and OAUTH_CALLBACK),
             "wechatJssdk": bool(WECHAT_APPID and WECHAT_SECRET),
+            "adminCode": bool(ADMIN_CODE),
         },
     }
 
@@ -307,6 +312,15 @@ def me(user_id: str = Depends(current_user)) -> dict:
 @app.get("/api/venues")
 def venues(user_id: str = Depends(current_user)) -> dict:
     return {"venues": db.list_venues()}
+
+
+@app.post("/api/venues/resolve")
+def resolve_venue(body: ResolveIn, user_id: str = Depends(require_admin)) -> dict:
+    """解析高德分享链接，返回可直接填进表单的场馆信息。"""
+    info = amap.resolve(body.url.strip())
+    if not info:
+        raise HTTPException(status_code=400, detail="没能识别这个链接，请确认是高德 App 分享的链接")
+    return info
 
 
 @app.post("/api/venues")

@@ -342,6 +342,11 @@
       const v = draftVenue;
       html +=
         '<div class="card"><h3>' + (v.id ? "编辑场馆" : "新增场馆") + "</h3>" +
+        '<div class="field"><label>高德分享链接（粘贴后点解析，自动填下面几项）</label>' +
+        '<div class="player-add" style="margin-top:0">' +
+        '<input type="text" id="v-url" placeholder="https://surl.amap.com/xxxx">' +
+        '<button class="mini-btn" id="v-resolve">解析</button></div>' +
+        '<div class="hint">在高德 App 里长按地点 → 分享 → 复制链接</div></div>' +
         '<div class="field"><label>场馆名</label><input type="text" id="v-name" value="' + esc(v.name) + '"></div>' +
         '<div class="field"><label>地址</label><input type="text" id="v-address" value="' + esc(v.address) + '"></div>' +
         '<div class="field"><label>纬度 latitude</label><input type="text" id="v-lat" value="' + esc(v.lat) + '"></div>' +
@@ -393,6 +398,27 @@
           }
         ]);
     });
+
+    const resolveBtn = view.querySelector("#v-resolve");
+    if (resolveBtn) {
+      resolveBtn.onclick = async () => {
+        const url = view.querySelector("#v-url").value.trim();
+        if (!url) return modal("先粘贴高德分享链接");
+        resolveBtn.textContent = "解析中…";
+        try {
+          const info = await S.resolveVenue(url);
+          if (info.name) view.querySelector("#v-name").value = info.name;
+          if (info.address) view.querySelector("#v-address").value = info.address;
+          if (info.lat != null) view.querySelector("#v-lat").value = info.lat;
+          if (info.lng != null) view.querySelector("#v-lng").value = info.lng;
+          if (!info.lat) modal("只识别到 POI，坐标请手动补：https://www.amap.com/detail/" + info.poiId);
+        } catch (e) {
+          modal((e && e.detail) || "解析失败，请确认是高德分享链接");
+        } finally {
+          resolveBtn.textContent = "解析";
+        }
+      };
+    }
 
     const save = view.querySelector("#v-save");
     if (save) {
@@ -476,7 +502,12 @@
             render();
           }
         } catch (e) {
-          modal((e && e.detail) || "验证失败");
+          const reason = e && e.offline
+            ? "网络不可达：请确认访问的是 http://<电脑IP>:18000/h5/admin.html（不是旧端口）"
+            : e && e.detail
+              ? e.detail
+              : "验证失败，请重试";
+          modal(reason, [{ label: "好的", primary: true }]);
         }
       };
       return;

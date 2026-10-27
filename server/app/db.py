@@ -110,7 +110,16 @@ DEFAULT_VENUES = [
         "lng": 116.55953943729398,
         "coord_type": "gcj02",
         "note": "高德 POI B0L0FU596D · 约 ¥37/人",
-    }
+    },
+    {
+        "id": "v_jingying_menggu",
+        "name": "菁英梦谷·常营12号楼",
+        "address": "朝阳北路甲27号菁英梦谷·常营",
+        "lat": 39.926193,
+        "lng": 116.581813,
+        "coord_type": "gcj02",
+        "note": "高德 POI B0KUNLUWR5 · 园区场地",
+    },
 ]
 
 

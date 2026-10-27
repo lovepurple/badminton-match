@@ -298,6 +298,10 @@
     return res.venues || [];
   }
 
+  async function resolveVenue(url) {
+    return call('/api/venues/resolve', { method: 'POST', data: { url } });
+  }
+
   async function saveVenue(venue) {
     const path = venue.id ? '/api/venues/' + venue.id : '/api/venues';
     return call(path, { method: venue.id ? 'PUT' : 'POST', data: venue });
@@ -365,6 +369,7 @@
     saveFormat,
     resetFormat,
     venues,
+    resolveVenue,
     saveVenue,
     removeVenue,
     meInfo,
