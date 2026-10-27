@@ -25,7 +25,7 @@
   const KEY = BASE_KEY + (OVERRIDE ? '@' + OVERRIDE : '');
 
   function blank() {
-    return { races: [], me: '', token: '', userId: '', deviceId: '', pending: [] };
+    return { races: [], me: '', avatar: '', token: '', userId: '', deviceId: '', pending: [] };
   }
 
   function load() {
@@ -42,6 +42,9 @@
   }
 
   const state = load();
+
+/* 头像字段兼容：老缓存里没有 */
+if (!state.avatar) state.avatar = "";
 
   function save() {
     try {
@@ -346,6 +349,26 @@
     return state.me || '';
   }
 
+  function avatar() {
+    return state.avatar || "";
+  }
+
+  async function updateProfile(profile) {
+    const updated = await call('/api/me', { method: 'PUT', data: profile });
+    if (profile.nickname) {
+      state.me = profile.nickname;
+    }
+    if (profile.avatar) {
+      state.avatar = profile.avatar;
+    }
+    save();
+    return updated;
+  }
+
+  async function people() {
+    return call('/api/people');
+  }
+
   function setMe(name) {
     state.me = name;
     save();
@@ -385,6 +408,9 @@
     adoptToken,
     hasToken,
     me,
-    setMe
+    setMe,
+    avatar,
+    updateProfile,
+    people
   };
 })(window);

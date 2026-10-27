@@ -141,6 +141,7 @@
   function tabBar() {
     return (
       '<div class="admin-tabs">' +
+      '<button data-atab="people" class="' + (tab === "people" ? "on" : "") + '">人员统计</button>' +
       '<button data-atab="formats" class="' + (tab === "formats" ? "on" : "") + '">玩法管理</button>' +
       '<button data-atab="venues" class="' + (tab === "venues" ? "on" : "") + '">场馆管理</button>' +
       "</div>"
@@ -301,6 +302,64 @@
     }
   }
 
+  /* ---------------- 人员统计 ---------------- */
+
+  async function renderPeople() {
+    topbar.innerHTML = topbarHTML({ title: "人员统计" });
+    wireTop();
+
+    let data;
+    try {
+      data = await S.people();
+    } catch (e) {
+      view.innerHTML = tabBar() + '<div class="empty">加载失败：' + esc((e && e.detail) || "请重试") + "</div>";
+      return;
+    }
+    const people = data.people || [];
+
+    let html = tabBar();
+    if (!people.length) {
+      html += '<div class="empty">还没有人报名/参赛</div>';
+    } else {
+      html += '<div class="hint" style="margin-bottom:12px">统计口径：报名次数 = 报过名的比赛；比赛场次/排名只统计实际开赛（进行中/已结束）。点开人员查看参赛历史。</div>';
+      html += '<div class="admin-grid">' + people.map((p) => {
+        const rate = p.rate != null ? Math.round(p.rate * 100) + "%" : "—";
+        const races = p.races || [];
+        return (
+          '<div class="card person-card">' +
+          '<h3>' + avatarHTML(p.avatar) + " " + esc(p.name) + "</h3>" +
+          '<div class="meta">报名 ' + p.signups + " 场 · 参赛 " + p.alls + " 场 · 胜 " + p.wins + " / 负 " + p.fail +
+          " · 积分 " + p.point + " · 净胜分 " + p.netball + " · 胜率 " + rate + "</div>" +
+          '<details><summary>参赛历史（' + races.length + "）</summary>" +
+          races.map((r) => {
+            const rank = r.rank != null ? "第 " + r.rank + " 名" : "未上榜";
+            return (
+              '<div class="person-race">' +
+              '<span class="meta">' + esc(r.raceName) + (r.date ? " · " + esc(String(r.date).replace("T", " ").slice(0, 16)) : "") +
+              (r.status === "done" ? " · 已结束" : " · 进行中") + "</span>" +
+              '<span class="meta">' + rank + " · " + r.wins + "-" + r.fail + " · 积分 " + r.point + " · 净胜分 " + r.netball + "</span>" +
+              "</div>"
+            );
+          }).join("") +
+          "</details></div>"
+        );
+      }).join("") + "</div>";
+    }
+    view.innerHTML = html;
+
+    view.querySelectorAll("[data-atab]").forEach((btn) => {
+      btn.onclick = () => {
+        tab = btn.dataset.atab;
+        render();
+      };
+    });
+  }
+
+  function avatarHTML(dataUrl) {
+    if (dataUrl) return '<img class="avatar" src="' + esc(dataUrl) + '" alt="">';
+    return '<span class="avatar avatar-empty">?</span>';
+  }
+
   /* ---------------- 场馆管理 ---------------- */
 
   async function renderVenues() {
@@ -458,7 +517,8 @@
 
   async function render() {
     const want = location.hash.replace("#", "");
-    if (want === "venues" || want === "formats") tab = want;
+    if (["people", "venues", "formats"].indexOf(want) >= 0) tab = want;
+    if (tab === "people") return renderPeople();
     if (tab === "venues") return renderVenues();
     return renderFormats();
   }

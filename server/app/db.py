@@ -26,6 +26,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id         TEXT PRIMARY KEY,
     nickname   TEXT,
+    avatar     TEXT,
     created_at INTEGER NOT NULL,
     role       TEXT NOT NULL DEFAULT 'user'
 );
@@ -84,6 +85,7 @@ CREATE TABLE IF NOT EXISTS participants (
     race_id   TEXT NOT NULL,
     user_id   TEXT NOT NULL,
     name      TEXT NOT NULL,
+    avatar    TEXT,
     gender    TEXT NOT NULL DEFAULT 'M',
     level     INTEGER NOT NULL DEFAULT 0,
     joined_at INTEGER NOT NULL,
@@ -97,6 +99,8 @@ COLUMNS = [
     ("races", "status", "TEXT NOT NULL DEFAULT 'draft'"),
     ("races", "max_players", "INTEGER NOT NULL DEFAULT 0"),
     ("users", "role", "TEXT NOT NULL DEFAULT 'user'"),
+    ("users", "avatar", "TEXT"),
+    ("participants", "avatar", "TEXT"),
 ]
 
 
@@ -149,12 +153,22 @@ def now() -> int:
 
 # ---- users / tokens -------------------------------------------------------
 
-def upsert_user(user_id: str, nickname: str | None = None) -> None:
+def upsert_user(user_id: str, nickname: str | None = None, avatar: str | None = None) -> None:
     with connect() as conn:
         conn.execute(
-            "INSERT INTO users(id, nickname, created_at) VALUES(?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET nickname=COALESCE(excluded.nickname, users.nickname)",
-            (user_id, nickname, now()),
+            "INSERT INTO users(id, nickname, avatar, created_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET"
+            " nickname=COALESCE(excluded.nickname, users.nickname),"
+            " avatar=COALESCE(excluded.avatar, users.avatar)",
+            (user_id, nickname, avatar, now()),
+        )
+
+
+def save_profile(user_id: str, nickname: str | None, avatar: str | None) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE users SET nickname=COALESCE(?, nickname), avatar=COALESCE(?, avatar) WHERE id=?",
+            (nickname, avatar, user_id),
         )
 
 
@@ -315,14 +329,17 @@ def set_status(race_id: str, status: str) -> None:
         )
 
 
-def add_participant(race_id: str, user_id: str, name: str, gender: str, level: int) -> None:
+def add_participant(
+    race_id: str, user_id: str, name: str, avatar: str | None, gender: str, level: int
+) -> None:
     with connect() as conn:
         conn.execute(
-            "INSERT INTO participants(race_id, user_id, name, gender, level, joined_at)"
-            " VALUES(?,?,?,?,?,?)"
+            "INSERT INTO participants(race_id, user_id, name, avatar, gender, level, joined_at)"
+            " VALUES(?,?,?,?,?,?,?)"
             " ON CONFLICT(race_id, user_id) DO UPDATE SET"
-            " name=excluded.name, gender=excluded.gender, level=excluded.level",
-            (race_id, user_id, name, gender, level, now()),
+            " name=excluded.name, avatar=excluded.avatar,"
+            " gender=excluded.gender, level=excluded.level",
+            (race_id, user_id, name, avatar, gender, level, now()),
         )
 
 
@@ -336,11 +353,25 @@ def remove_participant(race_id: str, user_id: str) -> None:
 def list_participants(race_id: str) -> list[dict]:
     with connect() as conn:
         rows = conn.execute(
-            "SELECT user_id, name, gender, level, joined_at FROM participants"
+            "SELECT user_id, name, avatar, gender, level, joined_at FROM participants"
             " WHERE race_id=? ORDER BY joined_at",
             (race_id,),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def list_races_all() -> list[dict]:
+    """所有比赛完整文档（后台统计用）。"""
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM races ORDER BY updated_at DESC").fetchall()
+    docs = []
+    for row in rows:
+        doc = race_row_to_doc(row)
+        doc["_ownerId"] = row["owner_id"]
+        doc["_updatedAt"] = row["updated_at"]
+        doc["status"] = row["status"]
+        docs.append(doc)
+    return docs
 
 
 # ---- venues ---------------------------------------------------------------

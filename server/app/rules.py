@@ -230,3 +230,85 @@ def personal_stats(races: list[dict], name: str) -> dict:
             rounds += len(sets)
 
     return {"total": total, "singles": singles, "doubles": doubles, "rounds": rounds}
+
+
+def person_stats(races: list[dict], participants_fn) -> list[dict]:
+    """人员统计（后台用）：报名次数 + 实际开赛的场次/胜负/积分/净胜分 + 单场排名历史。
+
+    只统计 status 为 playing/done 的比赛（实际开赛才算「参加过」）；
+    draft/open 只计入 signups。用户身份来自报名（participants.user_id 同时是对阵里的选手 id）。
+    """
+    from collections import defaultdict
+
+    users: dict[str, dict] = {}
+
+    for race in races:
+        status = race.get("status")
+        started = status in ("playing", "done")
+        parts = participants_fn(race["id"])
+        if not parts:
+            continue
+
+        rank_by_id = {}
+        if started and race.get("matches"):
+            result = compute(race)
+            for pos, row in enumerate(result["rows"], start=1):
+                rank_by_id[row["key"]] = (pos, row)
+
+        for p in parts:
+            uid = p["user_id"]
+            user = users.get(uid)
+            if user is None:
+                user = {
+                    "id": uid,
+                    "name": p.get("name") or "",
+                    "avatar": p.get("avatar"),
+                    "signups": 0,
+                    "alls": 0,
+                    "wins": 0,
+                    "fail": 0,
+                    "point": 0,
+                    "netball": 0,
+                    "races": [],
+                }
+                users[uid] = user
+            user["signups"] += 1
+            if not started:
+                continue
+
+            entry = {
+                "raceId": race["id"],
+                "raceName": race.get("name") or "未命名比赛",
+                "date": race.get("date"),
+                "status": status,
+                "mode": race.get("mode"),
+                "rank": None,
+                "wins": 0,
+                "fail": 0,
+                "point": 0,
+                "netball": 0,
+            }
+            hit = rank_by_id.get(uid)
+            if hit is not None:
+                pos, row = hit
+                user["alls"] += 1
+                user["wins"] += row["wins"]
+                user["fail"] += row["fail"]
+                user["point"] += row["point"]
+                user["netball"] += row["netball"]
+                entry.update(
+                    {
+                        "rank": pos,
+                        "wins": row["wins"],
+                        "fail": row["fail"],
+                        "point": row["point"],
+                        "netball": row["netball"],
+                    }
+                )
+            user["races"].append(entry)
+
+    people = list(users.values())
+    for u in people:
+        u["rate"] = round(u["wins"] / u["alls"], 4) if u["alls"] else None
+    people.sort(key=lambda u: (-u["alls"], u["name"]))
+    return people

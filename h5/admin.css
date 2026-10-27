@@ -84,3 +84,38 @@
     padding: 14px 12px 60px;
   }
 }
+.person-card h3 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.person-card .avatar {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: #eee;
+  flex: none;
+}
+
+.person-card .avatar-empty {
+  line-height: 40px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 18px;
+}
+
+.person-race {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--border);
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+
+.person-race:last-child {
+  border-bottom: 0;
+}

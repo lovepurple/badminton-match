@@ -184,6 +184,30 @@
     );
   }
 
+  function readAvatar(file) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(file);
+      img.onload = () => {
+        const size = 96;
+        const canvas = document.createElement("canvas");
+        canvas.width = size;
+        canvas.height = size;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, size, size);
+        const r = Math.min(size / img.width, size / img.height);
+        const w = img.width * r;
+        const h = img.height * r;
+        ctx.drawImage(img, (size - w) / 2, (size - h) / 2, w, h);
+        URL.revokeObjectURL(url);
+        resolve(canvas.toDataURL("image/jpeg", 0.8));
+      };
+      img.onerror = () => reject(new Error("图片读取失败"));
+      img.src = url;
+    });
+  }
+
   function formatDate(value) {
     if (!value) return '';
     const text = String(value).replace("T", " ");
@@ -227,6 +251,7 @@
     if (!parts.length) return renderRaces();
     stopPolling();
     if (parts[0] === 'stats') return renderStats();
+    if (parts[0] === 'me') return renderMe();
     if (parts[0] === 'create') return renderCreate();
     if (parts[0] === 'join') return renderJoin(parts[1]);
     if (parts[0] === "venues" || parts[0] === "formats") return goAdmin();
@@ -681,6 +706,10 @@
       '<div class="card">' +
       '<div class="field"><label>你的名字</label>' +
       '<input type="text" id="jname" value="' + esc(S.me()) + '" placeholder="例如：阿豪"></div>' +
+      '<div class="field"><label>头像（可跳过，报名后自动带上）</label>' +
+      avatarHTML(S.avatar(), "small") +
+      '<input type="file" id="j-avatar" accept="image/*" style="display:none">' +
+      '<button class="btn secondary" id="j-pick">选头像</button></div>' +
       '<div class="field"><label>性别</label><div class="segmented">' +
       '<button data-gender="M" class="on">男</button><button data-gender="F">女</button></div></div>' +
       '<div class="field"><label>水平</label><select id="jlevel">' +
@@ -692,6 +721,19 @@
     view.innerHTML = html;
     const navBtn = document.getElementById("nav-venue");
     if (navBtn) navBtn.onclick = () => openVenueNav(race.venue);
+
+    let pickedAvatar = S.avatar();
+    const pick = view.querySelector("#j-pick");
+    if (pick) {
+      pick.onclick = () => view.querySelector("#j-avatar").click();
+      view.querySelector("#j-avatar").onchange = async (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        pickedAvatar = await readAvatar(file);
+        const imgs = view.querySelectorAll(".avatar");
+        if (imgs[1]) imgs[1].src = pickedAvatar;
+      };
+    }
 
     let gender = "M";
     view.querySelectorAll("[data-gender]").forEach(btn => {
@@ -707,6 +749,7 @@
       try {
         await S.joinRace(race.id, {
           name,
+          avatar: pickedAvatar || undefined,
           gender,
           level: Number(document.getElementById("jlevel").value)
         });
@@ -1414,6 +1457,55 @@
     await S.createRace(race);
     draft = null;
     go('#/race/' + race.id);
+  }
+
+  /* ---------------- 我的（资料） ---------------- */
+
+  function avatarHTML(dataUrl, cls) {
+    if (dataUrl) return '<img class="avatar ' + (cls || "") + '" src="' + esc(dataUrl) + '" alt="">';
+    return '<div class="avatar avatar-empty ' + (cls || "") + '">?</div>';
+  }
+
+  async function renderMe() {
+    topbar.innerHTML = topbarHTML({ title: '我的', back: true });
+    wireTopbar({});
+
+    const name = S.me();
+    const av = S.avatar();
+    view.innerHTML =
+      '<div class="card">' +
+      avatarHTML(av, "big") +
+      '<div class="field"><label>昵称</label>' +
+      '<input type="text" id="me-name" value="' + esc(name) + '" placeholder="你的昵称"></div>' +
+      '<div class="field"><label>头像</label>' +
+      '<input type="file" id="me-avatar" accept="image/*" style="display:none">' +
+      '<button class="btn secondary" id="me-pick">选择头像</button></div>' +
+      '<button class="btn" id="me-save">保存</button>' +
+      '<div class="hint">昵称/头像用于报名与历史记录，只影响之后的报名。</div></div>';
+
+    let pickedAvatar = av;
+    document.getElementById("me-pick").onclick = () => document.getElementById("me-avatar").click();
+    document.getElementById("me-avatar").onchange = async (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      const dataUrl = await readAvatar(file);
+      pickedAvatar = dataUrl;
+      view.querySelector(".avatar").src = dataUrl;
+    };
+    document.getElementById("me-save").onclick = async () => {
+      const nickname = view.querySelector("#me-name").value.trim();
+      if (!nickname && !pickedAvatar) return;
+      try {
+        await S.updateProfile({
+          nickname: nickname || undefined,
+          avatar: pickedAvatar || undefined,
+        });
+        S.setMe(nickname);
+        modal("已保存", [{ label: "好的", primary: true }]);
+      } catch (err) {
+        modal((err && err.detail) || "保存失败");
+      }
+    };
   }
 
   /* ---------------- 战绩 ---------------- */

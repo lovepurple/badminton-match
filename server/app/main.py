@@ -65,6 +65,7 @@ app.add_middleware(
 class LoginIn(BaseModel):
     deviceId: str | None = None
     nickname: str | None = None
+    avatar: str | None = None
 
 
 class Player(BaseModel):
@@ -128,6 +129,7 @@ class OpenIn(BaseModel):
 
 class JoinIn(BaseModel):
     name: str
+    avatar: str | None = None
     gender: str = "M"
     level: int = 0
 
@@ -279,7 +281,7 @@ def wechat_callback(code: str, state: str) -> RedirectResponse:
 def login(body: LoginIn) -> dict:
     # 设备号登录：非微信环境，或微信授权不可用时的兜底
     user_id = "dev_" + (body.deviceId or uuid.uuid4().hex[:12])
-    db.upsert_user(user_id, body.nickname)
+    db.upsert_user(user_id, body.nickname, body.avatar)
     _assign_role(user_id, body.deviceId)
     token = secrets.token_urlsafe(24)
     db.create_token(token, user_id)
@@ -304,7 +306,27 @@ def claim_admin(body: AdminClaimIn, user_id: str = Depends(current_user)) -> dic
 @app.get("/api/me")
 def me(user_id: str = Depends(current_user)) -> dict:
     user = db.get_user(user_id) or {}
-    return {"id": user_id, "nickname": user.get("nickname") or "", "role": user.get("role", "user")}
+    return {
+        "id": user_id,
+        "nickname": user.get("nickname") or "",
+        "avatar": user.get("avatar"),
+        "role": user.get("role", "user"),
+    }
+
+
+class ProfileIn(BaseModel):
+    nickname: str | None = None
+    avatar: str | None = None
+
+
+@app.put("/api/me")
+def update_me(body: ProfileIn, user_id: str = Depends(current_user)) -> dict:
+    if body.avatar and len(body.avatar) > 300 * 1024:
+        raise HTTPException(status_code=400, detail="头像图片过大（上限 300KB）")
+    if body.nickname:
+        body.nickname = body.nickname.strip()[:20] or None
+    db.save_profile(user_id, body.nickname, body.avatar)
+    return me(user_id)
 
 
 # ---------------------------------------------------------------- 场馆
@@ -430,7 +452,15 @@ def join_race(race_id: str, body: JoinIn, user_id: str = Depends(current_user)) 
     limit = race.get("maxPlayers") or 0
     if limit and len(participants) >= limit and not any(p["user_id"] == user_id for p in participants):
         raise HTTPException(status_code=409, detail="报名已满")
-    db.add_participant(race_id, user_id, body.name.strip()[:20] or "球友", body.gender, body.level)
+    avatar = body.avatar if body.avatar and len(body.avatar) < 300 * 1024 else None
+    db.add_participant(
+        race_id,
+        user_id,
+        body.name.strip()[:20] or "球友",
+        avatar,
+        body.gender,
+        body.level,
+    )
     return {
         "participants": db.list_participants(race_id),
         "joined": True,
@@ -589,6 +619,12 @@ def index() -> RedirectResponse:
 def stats(name: str = Query(..., min_length=1), user_id: str = Depends(current_user)) -> dict:
     races = [db.get_race(item["id"]) for item in db.list_races(user_id)]
     return rules.personal_stats([r for r in races if r], name)
+
+
+@app.get("/api/people")
+def people_stats(user_id: str = Depends(require_admin)) -> dict:
+    """人员统计：报名/参赛/单场排名历史。只统计实际开赛（playing/done）的比赛。"""
+    return {"people": rules.person_stats(db.list_races_all(), db.list_participants)}
 
 
 # ---------------------------------------------------------------- 玩法
