@@ -1,0 +1,17 @@
+node_modules/
+__pycache__/
+.pytest_cache/
+*.pyc
+.DS_Store
+*.log
+
+# 本地数据库
+server/*.db
+server/*.db-wal
+server/*.db-shm
+
+# 本地密钥
+server/.env
+
+.pi/
+server/*.db-journal

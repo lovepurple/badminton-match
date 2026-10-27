@@ -1,0 +1,11 @@
+{
+  "name": "gorilla-badminton",
+  "version": "0.1.0",
+  "private": true,
+  "description": "猩球 · 羽球局：H5 + Python 服务端的羽毛球比赛工具",
+  "scripts": {
+    "test": "node tests/logic.test.js && node tests/plays.test.js && node tests/e2e.test.js",
+    "test:server": "cd server && python -m pytest -q",
+    "dev": "cd server && python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 18000"
+  }
+}

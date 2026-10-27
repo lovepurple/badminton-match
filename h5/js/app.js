@@ -1,0 +1,1850 @@
+(function (global) {
+  const R = BA.rules;
+  const F = BA.formats;
+  const K = BA.ranking;
+  const S = BA.store;
+
+  const view = document.getElementById('view');
+  const topbar = document.getElementById('topbar');
+  const tabbar = document.getElementById('tabbar');
+
+  const CHASE_MODES = ['wheelMatch', 'relayMatch', 'fixedTeams', 'singlesTeams', 'wheelTeams'];
+  const FREE_MODES = ['freeRound', 'freeRoundSingles', 'freeMatch'];
+
+  let draft = null;
+  let draftVenue = null;
+  let serverOk = false;
+  let myRole = "user";
+  let PLAYS = [];
+  let PLAY_MAP = {};
+  let VENUE_CACHE = null;
+
+  /* ---------------- 基础 ---------------- */
+
+  function esc(value) {
+    return String(value == null ? '' : value).replace(/[&<>"]/g, c => {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+
+  function modal(text, actions) {
+    document.getElementById('modal-text').textContent = text;
+    const box = document.getElementById('modal-actions');
+    box.innerHTML = '';
+    (actions || [{ label: '知道了', primary: true }]).forEach(action => {
+      const btn = document.createElement('button');
+      btn.textContent = action.label;
+      if (action.primary) btn.className = 'primary';
+      btn.onclick = () => {
+        closeModal();
+        if (action.fn) action.fn();
+      };
+      box.appendChild(btn);
+    });
+    document.getElementById('modal').hidden = false;
+  }
+
+  function closeModal() {
+    document.getElementById('modal').hidden = true;
+  }
+
+  function go(hash) {
+    location.hash = hash;
+  }
+
+  function topbarHTML(opts) {
+    return (
+      (opts.brand ? '<img class="brand-logo" src="assets/logo-96.png" alt="">' : '') +
+      (opts.back ? '<button class="back" data-back>‹</button>' : '') +
+      '<span>' + esc(opts.title || '') + '</span><span class="spacer"></span>' +
+      (opts.action ? '<button class="action" data-action>' + esc(opts.action) + '</button>' : '') +
+      (opts.ghost ? '<button class="ghost" data-ghost>' + esc(opts.ghost) + '</button>' : '')
+    );
+  }
+
+  function wireTopbar(opts) {
+    const back = topbar.querySelector('[data-back]');
+    if (back) back.onclick = () => history.back();
+    const action = topbar.querySelector('[data-action]');
+    if (action && opts.onAction) action.onclick = opts.onAction;
+    const ghost = topbar.querySelector('[data-ghost]');
+    if (ghost && opts.onGhost) ghost.onclick = opts.onGhost;
+  }
+
+  function sideName(race, ids) {
+    return ids
+      .map(id => {
+        const p = R.findPlayer(race.players, id);
+        return p ? p.name : '?';
+      })
+      .join(' / ');
+  }
+
+  function isChase(race) {
+    return CHASE_MODES.indexOf(race.mode) >= 0 && race.wheelMode === 'chase';
+  }
+
+  function chaseCap(race) {
+    if (['fixedTeams', 'singlesTeams', 'wheelTeams'].indexOf(race.mode) >= 0) {
+      return race.balls * (race.groupsValid || 3);
+    }
+    return race.balls * race.rounds;
+  }
+
+  function chaseBase(race, match) {
+    const base = [0, 0];
+    const teamMode = ['fixedTeams', 'singlesTeams', 'wheelTeams'].indexOf(race.mode) >= 0;
+    for (const m of race.matches) {
+      if (m === match) break;
+      if (teamMode && m.round !== match.round) continue;
+      (m.scores || []).forEach(s => {
+        base[0] += s[0];
+        base[1] += s[1];
+      });
+    }
+    return base;
+  }
+
+  function countAll(sets) {
+    let a = 0;
+    let b = 0;
+    sets.forEach(s => {
+      if (s[0] > s[1]) a++;
+      else if (s[0] < s[1]) b++;
+      else {
+        a++;
+        b++;
+      }
+    });
+    return [a, b];
+  }
+
+  async function loadPlays() {
+    let overrides = {};
+    try {
+      const res = await S.formatOverrides();
+      overrides = (res && res.overrides) || {};
+    } catch (e) {
+      overrides = {};
+    }
+    const base = (BA.plays && BA.plays.list ? BA.plays.list() : []);
+    PLAYS = base.map((play) => {
+      const o = overrides[play.id] || {};
+      return Object.assign({}, play, {
+        name: o.name || play.name,
+        intro: o.intro || play.intro,
+        rules: Object.assign({}, play.rules || {}, o.rules || {}),
+        defaults: Object.assign({}, play.defaults || {}, o.defaults || {}),
+        enabled: o.enabled !== false,
+        note: o.note || "",
+        hasOverride: !!overrides[play.id]
+      });
+    });
+    PLAY_MAP = {};
+    PLAYS.forEach((play) => {
+      PLAY_MAP[play.id] = play;
+    });
+    return PLAYS;
+  }
+
+  function playOf(id) {
+    return (
+      PLAY_MAP[id] || {
+        id,
+        name: id,
+        group: "doubles",
+        min: 2,
+        max: 50,
+        intro: "",
+        rules: {},
+        defaults: {}
+      }
+    );
+  }
+
+  function playRulesHTML(play) {
+    const r = play.rules || {};
+    const rows = [
+      ["参与人数", r.people],
+      ["怎么玩", r.how],
+      ["怎么分组", r.groups],
+      ["怎么结束", r.end],
+      ["怎么计分", r.score]
+    ].filter((row) => row[1]);
+    if (!rows.length) return "";
+    return (
+      '<div class="rules">' +
+      rows
+        .map(
+          (row) =>
+            '<div class="rule-row"><span class="rule-k">' + esc(row[0]) + "</span>" +
+            '<span class="rule-v">' + esc(row[1]) + "</span></div>"
+        )
+        .join("") +
+      "</div>"
+    );
+  }
+
+  function formatDate(value) {
+    if (!value) return '';
+    const text = String(value).replace("T", " ");
+    return text.length > 16 ? text.slice(0, 16) : text;
+  }
+
+  function venueLine(venue) {
+    if (!venue) return "";
+    const parts = [venue.name, venue.address].filter(Boolean);
+    return parts.map(esc).join(" · ");
+  }
+
+  async function openVenueNav(venue) {
+    if (!venue) return modal("还没有设置场馆");
+    const res = await BA.nav.openLocation(venue, { nav: true });
+    if (res.via === "address") {
+      modal("已复制场馆地址，可粘贴到地图 App 搜索", [{ label: "好的", primary: true }]);
+    } else if (!res.ok) {
+      modal("该场馆还没有坐标，请先在「场馆」里补全");
+    }
+  }
+
+  /* ---------------- 路由 ---------------- */
+
+  async function route() {
+    const hash = location.hash.replace(/^#/, '') || '/';
+    const parts = hash.split('/').filter(Boolean);
+    tabbar.querySelectorAll('a').forEach(a => {
+      a.classList.toggle(
+        'active',
+        (parts[0] === 'stats' && a.dataset.tab === 'stats') ||
+          (parts[0] !== 'stats' && a.dataset.tab === 'races')
+      );
+    });
+
+    if (!parts.length) return renderRaces();
+    stopPolling();
+    if (parts[0] === 'stats') return renderStats();
+    if (parts[0] === 'create') return renderCreate();
+    if (parts[0] === 'join') return renderJoin(parts[1]);
+    if (parts[0] === 'venues') return renderVenues();
+    if (parts[0] === 'formats') return renderFormats();
+    if (parts[0] === 'race') {
+      let race = S.getRace(parts[1]);
+      if (!race) {
+        // 直接打开链接 / 刚报名还没拉过列表：回源取一次
+        try {
+          race = await S.fetchRace(parts[1]);
+        } catch (e) {
+          race = null;
+        }
+      }
+      if (!race) return renderRaces();
+      if (parts[2] === 'match') return renderMatch(race, parts[3]);
+      return renderRace(race, parts[2] || 'matches');
+    }
+    renderRaces();
+  }
+
+  /* ---------------- 比赛列表 ---------------- */
+
+  async function renderRaces() {
+    topbar.innerHTML = topbarHTML({
+      title: '猩球 · 羽球局',
+      action: '新建',
+      brand: true,
+      ghost: myRole === 'admin' ? '后台' : ''
+    });
+    wireTopbar({
+      onAction: () => {
+        draft = null;
+        go('#/create');
+      },
+      onGhost: () => go('#/venues')
+    });
+
+    const races = S.races();
+    const status = serverOk ? '已连接服务器' : '离线 · 仅本地缓存';
+    if (!races.length) {
+      view.innerHTML =
+        '<div class="empty">' +
+        '<img class="logo" src="assets/logo-192.png" alt="猩球 · 羽球局">' +
+        '<div>还没有比赛</div><div>点右上角「新建」创建一场</div></div>' +
+        '<div class="hint center">' + esc(status) + '</div>';
+      return;
+    }
+
+    view.innerHTML =
+      races
+        .map(race => {
+          const done = race.matches.filter(m => m.status === 'done').length;
+          return (
+            '<div class="card" data-race="' + esc(race.id) + '">' +
+            '<h3>' + esc(race.name) + '</h3>' +
+            '<div class="meta">' + esc(playOf(race.mode).name) + ' · ' +
+            esc(R.roundsName(race.rounds)) + ' · ' + esc(R.ballsName(race.balls)) + '</div>' +
+            (race.date || (race.venue && race.venue.name)
+              ? '<div class="meta">' + esc(formatDate(race.date)) +
+                (race.venue && race.venue.name ? ' · ' + esc(race.venue.name) : '') + '</div>'
+              : '') +
+            '<div class="meta" style="margin-top:6px">' +
+            '<span class="badge">' + race.players.length + ' 人</span> ' +
+            '<span class="badge">' + done + '/' + race.matches.length + ' 场</span> ' +
+            '<span class="badge">' + esc(R.rankName(race.rankMode)) + '</span>' +
+            '</div></div>'
+          );
+        })
+        .join('') +
+      '<div class="hint center">' + esc(status) + '</div>';
+
+    view.querySelectorAll('[data-race]').forEach(node => {
+      node.onclick = () => go('#/race/' + node.dataset.race);
+    });
+  }
+
+  /* ---------------- 比赛详情 ---------------- */
+
+  let pollTimer = null;
+  let pollRaceId = null;
+  const lastStamp = {};
+
+  function stopPolling() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = null;
+    pollRaceId = null;
+  }
+
+  function joinLink(race) {
+    if (!race.joinCode) return '';
+    return location.origin + location.pathname + "#/join/" + race.joinCode;
+  }
+
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return modal("链接已复制", [{ label: "好的", primary: true }]);
+    } catch (e) {
+      /* 非 https / 旧浏览器：走 execCommand 兜底 */
+    }
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "readonly");
+      ta.style.position = "fixed";
+      ta.style.top = "-1000px";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, text.length);
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      if (ok) return modal("链接已复制", [{ label: "好的", primary: true }]);
+    } catch (e) {
+      /* 继续降级 */
+    }
+    modal(text, [{ label: "长按上面的链接可复制", primary: true }]);
+  }
+
+  const STATUS_TEXT = { draft: "未开放", open: "报名中", playing: "进行中", done: "已结束" };
+
+  async function renderRace(race, tab) {
+    stopPolling();
+    let info = null;
+    try {
+      info = await S.participants(race.id);
+    } catch (e) {
+      info = null;
+    }
+    const participants = info ? info.participants : [];
+    const isOwner = info ? info.isOwner : false;
+    const status = race.status || "draft";
+
+    topbar.innerHTML = topbarHTML({ title: race.name, back: true, ghost: isOwner ? "删除" : "" });
+    wireTopbar({
+      onGhost: () => {
+        if (!isOwner) return;
+        modal("删除「" + race.name + "」？", [
+          { label: "取消" },
+          {
+            label: "删除",
+            primary: true,
+            fn: async () => {
+              await S.removeRace(race.id);
+              go("#/");
+            }
+          }
+        ]);
+      }
+    });
+
+    let html =
+      '<div class="card">' +
+      '<h3>' + esc(playOf(race.mode).name) +
+      ' <span class="badge">' + esc(STATUS_TEXT[status] || status) + "</span></h3>" +
+      '<div class="meta">' + esc(R.roundsName(race.rounds)) + " · " +
+      esc(R.ballsName(race.balls)) + (isChase(race) ? " · 连续追分" : "") + "</div>" +
+      '<div class="meta" style="margin-top:4px">排名：' + esc(R.rankName(race.rankMode)) + " · " +
+      (BA.plays.entityKind(race.mode) === "team" ? "按队伍" : "按个人") + "</div>" +
+      (race.date ? '<div class="meta" style="margin-top:6px">时间：' + esc(formatDate(race.date)) + "</div>" : "") +
+      (race.venue && race.venue.name
+        ? '<div class="meta">场馆：' + venueLine(race.venue) +
+          ' <button class="mini-link" id="nav-venue">导航</button></div>'
+        : "") +
+      (race.joinCode ? '<div class="meta" style="margin-top:6px">报名码：' + esc(race.joinCode) + "</div>" : "") +
+      "</div>";
+
+    if (race.playRules) {
+      html += '<details class="card"><summary>玩法规则</summary>' +
+        playRulesHTML({ rules: race.playRules }) + "</details>";
+    }
+
+    let actions = "";
+    if (status === "draft" && isOwner) {
+      actions += '<button class="btn" id="open-signup">开放报名</button>';
+    }
+    if (status === "open" && isOwner) {
+      actions += '<button class="btn secondary" id="copy-link">复制报名链接</button>';
+      actions += '<button class="btn" id="start-race">开始比赛</button>';
+    }
+    if (status === "playing" && isOwner) {
+      actions += '<button class="btn" id="finish-race">结束比赛</button>';
+    }
+    if (actions) html += '<div class="card">' + actions + "</div>";
+
+    if (status === "open" || status === "playing") {
+      html +=
+        '<div class="card"><div class="field-label">报名（' + participants.length +
+        (race.maxPlayers ? "/" + race.maxPlayers : "") + "）</div>" +
+        (participants.length
+          ? participants
+              .map(
+                p =>
+                  '<div class="player-row"><span class="name">' + esc(p.name) + "</span>" +
+                  '<span class="tag">' + (p.gender === "F" ? "女" : "男") + " · " + p.level + "级</span></div>"
+              )
+              .join("")
+          : '<div class="meta">还没有人报名</div>') +
+        "</div>";
+    }
+
+    if (status === "playing" && race.matches.length) {
+      html +=
+        '<div class="tabs">' +
+        '<button data-tab="matches" class="' + (tab === "matches" ? "on" : "") + '">对阵</button>' +
+        '<button data-tab="rank" class="' + (tab === "rank" ? "on" : "") + '">排名</button>' +
+        "</div>" +
+        (tab === "rank" ? rankHTML(race) : matchesHTML(race));
+    } else if (status !== "done") {
+      html += '<div class="empty">' +
+        (status === "draft" ? "开放报名后，等人齐再开始比赛" : "人齐后由组织者开始比赛") +
+        "</div>";
+    }
+
+    if (status === "done") html += '<div id="summary"></div>';
+
+    view.innerHTML = html;
+
+    view.querySelectorAll("[data-tab]").forEach(btn => {
+      btn.onclick = () => go("#/race/" + race.id + "/" + btn.dataset.tab);
+    });
+    view.querySelectorAll("[data-match]").forEach(node => {
+      node.onclick = () => go("#/race/" + race.id + "/match/" + node.dataset.match);
+    });
+    const add = view.querySelector("[data-addmatch]");
+    if (add) add.onclick = () => addFreeMatch(race);
+
+    const navBtn = view.querySelector("#nav-venue");
+    if (navBtn) navBtn.onclick = () => openVenueNav(race.venue);
+
+    const openBtn = view.querySelector("#open-signup");
+    if (openBtn) {
+      openBtn.onclick = async () => {
+        try {
+          await S.openSignup(race, 0);
+          renderRace(S.getRace(race.id), tab);
+        } catch (e) {
+          modal((e && e.detail) || "开放报名失败");
+        }
+      };
+    }
+
+    const copyBtn = view.querySelector("#copy-link");
+    if (copyBtn) copyBtn.onclick = () => copyText(joinLink(race));
+
+    const startBtn = view.querySelector("#start-race");
+    if (startBtn) {
+      startBtn.onclick = () => {
+        const min = (R.MODES[race.mode] && R.MODES[race.mode].min) || 2;
+        if (participants.length < min) return modal("至少需要 " + min + " 人才能开始");
+        modal("用当前 " + participants.length + " 人开始比赛？", [
+          { label: "取消" },
+          {
+            label: "开始",
+            primary: true,
+            fn: async () => {
+              const players = participants.map(p => ({
+                id: p.user_id,
+                name: p.name,
+                gender: p.gender,
+                level: p.level
+              }));
+              const next = Object.assign({}, race, { players, teams: [] });
+              const matches = F.generate(next).map(m => ({
+                id: S.uid("m"),
+                round: m.round,
+                court: m.court,
+                side1: m.side1,
+                side2: m.side2,
+                teamA: m.teamA,
+                teamB: m.teamB,
+                scores: [],
+                scoreAll: null,
+                crt: [0, 0],
+                status: "pending"
+              }));
+              if (!matches.length) return modal("当前人数无法生成对阵");
+              try {
+                await S.startRace(race.id, players, matches);
+                renderRace(S.getRace(race.id), "matches");
+              } catch (e) {
+                modal((e && e.detail) || "开始比赛失败");
+              }
+            }
+          }
+        ]);
+      };
+    }
+
+    const finishBtn = view.querySelector("#finish-race");
+    if (finishBtn) {
+      finishBtn.onclick = () =>
+        modal("结束比赛并汇总成绩？", [
+          { label: "取消" },
+          {
+            label: "结束",
+            primary: true,
+            fn: async () => {
+              try {
+                await S.finishRace(race.id);
+                await S.pull();
+                renderRace(S.getRace(race.id), tab);
+              } catch (e) {
+                modal((e && e.detail) || "结束比赛失败");
+              }
+            }
+          }
+        ]);
+    }
+
+    if (status === "done") loadSummary(race);
+    startPolling(race, status, tab);
+  }
+
+  function startPolling(race, status, tab) {
+    if (status !== "open" && status !== "playing") return;
+    const raceId = race.id;
+    pollRaceId = raceId;
+    pollTimer = setInterval(async () => {
+      if (pollRaceId !== raceId) return;
+      if (location.hash.indexOf("/race/" + raceId) < 0) return stopPolling();
+      try {
+        if (status === "open") {
+          const info = await S.participants(raceId);
+          const fresh = S.getRace(raceId);
+          if (fresh && !fresh.matches.length && info.status === "open") renderRace(fresh, tab);
+        } else {
+          const res = await S.live(raceId, lastStamp[raceId] || 0);
+          if (res.changed && res.race) {
+            lastStamp[raceId] = res.updatedAt;
+            S.cache(res.race);
+            renderRace(S.getRace(raceId), tab);
+          }
+        }
+      } catch (e) {
+        /* 单次失败忽略 */
+      }
+    }, 4000);
+  }
+
+  async function loadSummary(race) {
+    const box = document.getElementById("summary");
+    if (!box) return;
+    try {
+      const data = await S.summary(race.id);
+      const rows = data.ranking.rows
+        .map(
+          (r, i) =>
+            "<tr><td class=\"num\">" + (i + 1) + "</td>" +
+            "<td class=\"name\">" + esc(r.name) + "</td>" +
+            "<td class=\"num\">" + r.wins + "-" + r.fail + "</td>" +
+            "<td class=\"num\">" + r.point + "</td>" +
+            "<td class=\"num\">" + (r.netball > 0 ? "+" : "") + r.netball + "</td></tr>"
+        )
+        .join("");
+      const played = (data.matches || []).filter(m => m.scoreAll && m.scores.length);
+      box.innerHTML =
+        '<div class="card"><h3>最终排名</h3>' +
+        '<table class="rank-table"><thead><tr><th>#</th>' +
+        '<th style="text-align:left">' + (data.ranking.kind === "team" ? "队伍" : "选手") + "</th>" +
+        "<th>胜-负</th><th>积分</th><th>净胜分</th></tr></thead><tbody>" + rows + "</tbody></table></div>" +
+        '<div class="card"><h3>已结束的场次</h3>' +
+        (played.length
+          ? played
+              .map(
+                m =>
+                  '<div class="row" style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px dashed var(--border)">' +
+                  "<span>" + esc(sideName(race, m.side1)) + " vs " + esc(sideName(race, m.side2)) + "</span>" +
+                  "<span>" + m.scores.map(x => x[0] + "-" + x[1]).join(" ") + "</span></div>"
+              )
+              .join("")
+          : '<div class="meta">还没有完成的对阵</div>') +
+        "</div>";
+    } catch (e) {
+      box.innerHTML = "";
+    }
+  }
+
+  /* ---------------- 报名页 ---------------- */
+
+  async function renderJoin(code) {
+    topbar.innerHTML = topbarHTML({ title: "报名", back: true });
+    wireTopbar({});
+    view.innerHTML = '<div class="empty">加载中…</div>';
+
+    let info;
+    try {
+      info = await S.joinInfo(code);
+    } catch (e) {
+      view.innerHTML = '<div class="empty">' + esc((e && e.detail) || "报名链接无效") + "</div>";
+      return;
+    }
+
+    const race = info.race;
+    const status = race.status;
+    let html =
+      '<div class="card"><h3>' + esc(race.name) + "</h3>" +
+      '<div class="meta">' + esc(playOf(race.mode).name) + " · " +
+      esc(R.roundsName(race.rounds)) + " · " + esc(R.ballsName(race.balls)) + "</div>" +
+      (race.date ? '<div class="meta" style="margin-top:4px">时间：' + esc(formatDate(race.date)) + "</div>" : "") +
+      (race.venue && race.venue.name
+        ? '<div class="meta">场馆：' + venueLine(race.venue) +
+          ' <button class="mini-link" id="nav-venue">导航</button></div>'
+        : "") +
+      '<div class="meta" style="margin-top:4px">' +
+      (race.maxPlayers ? "限 " + race.maxPlayers + " 人" : "不限人数") + " · 已报名 " +
+      info.participants.length + " 人</div></div>";
+
+    if (status !== "open") {
+      html += '<div class="card"><div class="meta">' +
+        (status === "playing" ? "比赛已开始，可以查看实时比分" : "报名未开放或已结束") + "</div></div>";
+      html += info.participants.length
+        ? '<div class="card"><div class="field-label">报名名单</div>' +
+          info.participants.map(p => '<div class="player-row"><span class="name">' + esc(p.name) + "</span></div>").join("") +
+          "</div>"
+        : "";
+      if (status === "playing") html += '<button class="btn" id="watch">查看实时比分</button>';
+      view.innerHTML = html;
+      const navBtn = document.getElementById("nav-venue");
+      if (navBtn) navBtn.onclick = () => openVenueNav(race.venue);
+      const watch = document.getElementById("watch");
+      if (watch) watch.onclick = () => go("#/race/" + race.id);
+      return;
+    }
+
+    if (info.joined) {
+      html +=
+        '<div class="card"><div class="meta">你已报名</div>' +
+        '<div class="field-label" style="margin-top:10px">报名名单</div>' +
+        info.participants
+          .map(p => '<div class="player-row"><span class="name">' + esc(p.name) + "</span></div>")
+          .join("") +
+        "</div>" +
+        '<button class="btn" id="enter">进入比赛</button>' +
+        '<button class="btn danger" id="leave">退出报名</button>';
+      view.innerHTML = html;
+      const navBtn = document.getElementById("nav-venue");
+      if (navBtn) navBtn.onclick = () => openVenueNav(race.venue);
+      document.getElementById("enter").onclick = () => go("#/race/" + race.id);
+      document.getElementById("leave").onclick = async () => {
+        try {
+          await S.leaveRace(race.id);
+          renderJoin(code);
+        } catch (e) {
+          modal((e && e.detail) || "退出失败");
+        }
+      };
+      return;
+    }
+
+    html +=
+      '<div class="card">' +
+      '<div class="field"><label>你的名字</label>' +
+      '<input type="text" id="jname" value="' + esc(S.me()) + '" placeholder="例如：阿豪"></div>' +
+      '<div class="field"><label>性别</label><div class="segmented">' +
+      '<button data-gender="M" class="on">男</button><button data-gender="F">女</button></div></div>' +
+      '<div class="field"><label>水平</label><select id="jlevel">' +
+      levelOptions() +
+      "</select></div>" +
+      '<button class="btn" id="join">确认报名</button>' +
+      "</div>";
+
+    view.innerHTML = html;
+    const navBtn = document.getElementById("nav-venue");
+    if (navBtn) navBtn.onclick = () => openVenueNav(race.venue);
+
+    let gender = "M";
+    view.querySelectorAll("[data-gender]").forEach(btn => {
+      btn.onclick = () => {
+        gender = btn.dataset.gender;
+        view.querySelectorAll("[data-gender]").forEach(b => b.classList.toggle("on", b === btn));
+      };
+    });
+
+    document.getElementById("join").onclick = async () => {
+      const name = document.getElementById("jname").value.trim();
+      if (!name) return modal("请填写名字");
+      try {
+        await S.joinRace(race.id, {
+          name,
+          gender,
+          level: Number(document.getElementById("jlevel").value)
+        });
+        S.setMe(name);
+        S.pull();
+        renderJoin(code);
+      } catch (e) {
+        modal((e && e.detail) || "报名失败");
+      }
+    };
+  }
+
+  function matchesHTML(race) {
+    if (!race.matches.length) {
+      return (
+        '<div class="empty">还没有对阵' +
+        (FREE_MODES.indexOf(race.mode) >= 0
+          ? '<br><button class="btn secondary" data-addmatch style="margin-top:16px">添加对阵</button>'
+          : '') +
+        '</div>'
+      );
+    }
+    let out = '';
+    let lastRound = null;
+    race.matches.forEach(m => {
+      if (m.round !== lastRound) {
+        out += '<div class="round-title">第 ' + m.round + ' 轮</div>';
+        lastRound = m.round;
+      }
+      const win1 = m.scoreAll && m.scoreAll[0] > m.scoreAll[1];
+      const win2 = m.scoreAll && m.scoreAll[1] > m.scoreAll[0];
+      const sets = (m.scores || []).map(s => s[0] + '-' + s[1]).join(' ');
+      out +=
+        '<div class="match" data-match="' + esc(m.id) + '">' +
+        '<div class="side' + (win1 ? ' win' : '') + '">' + esc(sideName(race, m.side1)) + '</div>' +
+        '<div class="score">' + (m.scoreAll ? m.scoreAll[0] + ':' + m.scoreAll[1] : '未开始') +
+        (sets ? '<span class="sub">' + esc(sets) + '</span>' : '') + '</div>' +
+        '<div class="side right' + (win2 ? ' win' : '') + '">' + esc(sideName(race, m.side2)) + '</div>' +
+        '</div>';
+    });
+    if (FREE_MODES.indexOf(race.mode) >= 0) {
+      out += '<button class="btn secondary" data-addmatch style="margin-top:12px">添加对阵</button>';
+    }
+    return out;
+  }
+
+  function rankHTML(race) {
+    const result = K.compute(race);
+    if (!result.rows.length) return '<div class="empty">还没有可排名的数据</div>';
+    const rows = result.rows
+      .map(
+        (r, i) =>
+          '<tr><td class="num">' + (i + 1) + '</td>' +
+          '<td class="name">' + esc(r.name) + '</td>' +
+          '<td class="num">' + r.wins + '-' + r.fail + '</td>' +
+          '<td class="num">' + r.point + '</td>' +
+          '<td class="num">' + (r.netball > 0 ? '+' : '') + r.netball + '</td>' +
+          '<td class="num">' + Math.round(r.rate.alls * 100) + '%</td></tr>'
+      )
+      .join('');
+    return (
+      '<table class="rank-table"><thead><tr><th>#</th>' +
+      '<th style="text-align:left">' + (result.kind === 'team' ? '队伍' : '选手') + '</th>' +
+      '<th>胜-负</th><th>积分</th><th>净胜分</th><th>胜率</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody></table>'
+    );
+  }
+
+  async function addFreeMatch(race) {
+    const size = race.mode === 'freeRoundSingles' || race.mode === 'singlesMatch' ? 1 : 2;
+    if (race.players.length < size * 2) return modal('选手不足，先补充选手');
+    const picked = [];
+    const pick = () => {
+      if (picked.length === size * 2) return finish();
+      const options = race.players.filter(p => picked.indexOf(p.id) < 0);
+      modal('选择第 ' + (picked.length + 1) + ' 位选手', options.map(p => ({
+        label: p.name,
+        fn: () => {
+          picked.push(p.id);
+          pick();
+        }
+      })));
+    };
+    const finish = async () => {
+      const last = race.matches[race.matches.length - 1];
+      race.matches.push({
+        id: S.uid('m'),
+        round: last ? last.round + 1 : 1,
+        court: 1,
+        side1: picked.slice(0, size),
+        side2: picked.slice(size),
+        scores: [],
+        scoreAll: null,
+        crt: [0, 0],
+        status: 'pending'
+      });
+      await S.updateRace(race);
+      route();
+    };
+    pick();
+  }
+
+  /* ---------------- 记分 ---------------- */
+
+  async function renderMatch(race, mid) {
+    const match = race.matches.find(m => m.id === mid);
+    if (!match) return go('#/race/' + race.id);
+
+    const chase = isChase(race);
+    if (!match.crt) match.crt = chase ? chaseBase(race, match) : [0, 0];
+    if (!match.scoreAll && match.scores.length) match.scoreAll = countAll(match.scores);
+
+    topbar.innerHTML = topbarHTML({ title: '第 ' + (match.scores.length + 1) + ' 局', back: true });
+    wireTopbar({});
+
+    const base = chase ? chaseBase(race, match) : [0, 0];
+    const quick = R.quickScores(race.balls, race.rounds, chase);
+    const chips = [];
+    [0, 1].forEach(side => {
+      quick.forEach(v => {
+        const value = chase ? base[side] + v : v;
+        chips.push({ side, value, label: (side === 0 ? '左 ' : '右 ') + value });
+      });
+    });
+
+    view.innerHTML =
+      '<div class="scoreboard">' +
+      '<div class="sb-head"><span>' + esc(playOf(race.mode).name) + '</span>' +
+      '<span>局分 ' + (match.scoreAll ? match.scoreAll[0] : 0) + ' : ' +
+      (match.scoreAll ? match.scoreAll[1] : 0) + (chase ? ' · 累计' : '') + '</span></div>' +
+      '<div class="sb-body">' +
+      sbSide(race, match, 0, match.crt[0]) +
+      sbSide(race, match, 1, match.crt[1]) +
+      '</div>' +
+      '<div class="chips">' +
+      chips.map((c, i) => '<button data-quick="' + i + '">' + esc(c.label) + '</button>').join('') +
+      '</div>' +
+      '<button class="btn secondary" id="cede" style="margin-top:12px">让分</button>' +
+      '<button class="btn" id="commit" style="margin-top:12px">' +
+      (chase ? '完成本场' : '完成本局') + '</button>' +
+      (match.status === 'done' ? '<button class="btn danger" id="reset" style="margin-top:10px">重置本场</button>' : '') +
+      '</div>' +
+      setsHTML(match);
+
+    view.querySelectorAll('[data-plus]').forEach(btn => {
+      btn.onclick = () => {
+        const side = Number(btn.dataset.plus);
+        match.crt[side] = Math.min(9999, match.crt[side] + 1);
+        S.cache(race);
+        renderMatch(race, mid);
+      };
+    });
+    view.querySelectorAll('[data-minus]').forEach(btn => {
+      btn.onclick = () => {
+        const side = Number(btn.dataset.minus);
+        match.crt[side] = Math.max(0, match.crt[side] - 1);
+        S.cache(race);
+        renderMatch(race, mid);
+      };
+    });
+    view.querySelectorAll('[data-quick]').forEach(btn => {
+      btn.onclick = () => {
+        const chip = chips[Number(btn.dataset.quick)];
+        match.crt[chip.side] = chip.value;
+        S.cache(race);
+        renderMatch(race, mid);
+      };
+    });
+
+    document.getElementById('cede').onclick = () => {
+      const cp = R.cedePoint(match.side1, match.side2, race.players, race.balls);
+      if (!cp) return modal('对阵双方性别相同，或当前分制没有默认让分');
+      const b = chase ? chaseBase(race, match) : [0, 0];
+      match.crt = [b[0], b[1]];
+      match.crt[cp.side] += cp.points;
+      S.cache(race);
+      renderMatch(race, mid);
+    };
+
+    document.getElementById('commit').onclick = () => commitSet(race, match);
+
+    const reset = document.getElementById('reset');
+    if (reset) {
+      reset.onclick = () =>
+        modal('重置本场比分？', [
+          { label: '取消' },
+          {
+            label: '重置',
+            primary: true,
+            fn: async () => {
+              match.scores = [];
+              match.scoreAll = null;
+              match.status = 'pending';
+              match.crt = chase ? chaseBase(race, match) : [0, 0];
+              await S.updateMatch(race.id, match);
+              renderMatch(race, mid);
+            }
+          }
+        ]);
+    }
+  }
+
+  function sbSide(race, match, side, pts) {
+    return (
+      '<div class="sb-side">' +
+      '<div class="who">' + esc(sideName(race, side === 0 ? match.side1 : match.side2)) + '</div>' +
+      '<div class="pts">' + pts + '</div>' +
+      '<div class="btns">' +
+      '<button data-minus="' + side + '">−</button>' +
+      '<button class="plus" data-plus="' + side + '">+</button>' +
+      '</div></div>'
+    );
+  }
+
+  function setsHTML(match) {
+    if (!match.scores.length) return '';
+    const rows = match.scores
+      .map((s, i) => '<div class="row"><span>第 ' + (i + 1) + ' 局</span><span>' + s[0] + ' : ' + s[1] + '</span></div>')
+      .join('');
+    return '<div class="card set-list"><div class="meta" style="margin-bottom:6px">已记比分</div>' + rows + '</div>';
+  }
+
+  async function commitSet(race, match) {
+    if (isChase(race)) return commitChase(race, match);
+
+    const verdict = R.judgeSet(match.crt, race.balls);
+    if (verdict.kind === 'invalid') return modal(verdict.reason);
+    if (verdict.kind === 'warn') {
+      return modal(verdict.reason, [
+        { label: '继续记分' },
+        {
+          label: '下一局',
+          primary: true,
+          fn: () => {
+            match.scores.push(match.crt.slice());
+            match.scoreAll = countAll(match.scores);
+            match.crt = [0, 0];
+            afterSet(race, match);
+          }
+        }
+      ]);
+    }
+    match.scores.push(match.crt.slice());
+    match.scoreAll = countAll(match.scores);
+    match.crt = [0, 0];
+    afterSet(race, match);
+  }
+
+  async function afterSet(race, match) {
+    const done = R.judgeMatch(match.scores, match.scoreAll, race.rounds);
+    S.cache(race);
+    if (done.done) {
+      modal(done.reason, [
+        { label: '下一局' },
+        {
+          label: '完成记分',
+          primary: true,
+          fn: async () => {
+            match.status = 'done';
+            await S.updateMatch(race.id, match);
+            go('#/race/' + race.id);
+          }
+        }
+      ]);
+      renderMatch(race, match.id);
+      return;
+    }
+    await S.updateMatch(race.id, match);
+    renderMatch(race, match.id);
+  }
+
+  async function commitChase(race, match) {
+    const verdict = R.judgeChase(match.crt, chaseCap(race));
+    if (verdict.kind !== 'ok') return modal(verdict.reason);
+
+    const base = chaseBase(race, match);
+    const delta = [match.crt[0] - base[0], match.crt[1] - base[1]];
+    if (delta[0] < 0 || delta[1] < 0) return modal('本局新增比分不能小于0哦');
+
+    match.scores = [delta];
+    match.scoreAll = delta[0] > delta[1] ? [1, 0] : [0, 1];
+    match.status = 'done';
+    await S.updateMatch(race.id, match);
+    go('#/race/' + race.id);
+  }
+
+  /* ---------------- 新建 ---------------- */
+
+  function blankDraft() {
+    return {
+      name: '周末羽球',
+      date: '',
+      venueId: '',
+      signup: true,
+      group: 'doubles',
+      mode: 'eight',
+      rounds: 3,
+      balls: 21,
+      wheelMode: 'isolate',
+      partnerMode: 'random',
+      rankMode: 'pointFirst',
+      matchesPerEntity: 3,
+      arenaKings: 1,
+      groupSize: 4,
+      players: [],
+      teams: [
+        { name: 'A 队', players: [] },
+        { name: 'B 队', players: [] }
+      ]
+    };
+  }
+
+  async function renderCreate() {
+    if (!draft) draft = blankDraft();
+    topbar.innerHTML = topbarHTML({ title: '新建比赛', back: true });
+    wireTopbar({});
+
+    if (VENUE_CACHE === null) {
+      try {
+        VENUE_CACHE = await S.venues();
+      } catch (e) {
+        VENUE_CACHE = [];
+      }
+    }
+    const venues = VENUE_CACHE;
+
+    const modes = PLAYS.filter(
+      (play) => play.group === draft.group && play.enabled !== false
+    );
+    const isTeam = draft.group === 'match' || draft.group === 'teams';
+
+    let html =
+      '<div class="card">' +
+      '<div class="field"><label>比赛名称</label>' +
+      '<input type="text" id="race-name" value="' + esc(draft.name) + '"></div>' +
+      '<div class="field"><label>比赛时间</label>' +
+      '<input type="datetime-local" id="race-date" value="' + esc(draft.date) + '"></div>' +
+      '<div class="field"><label>场馆</label>' +
+      '<select id="race-venue"><option value="">不指定</option>' +
+      venues.map(v =>
+        '<option value="' + esc(v.id) + '"' + (draft.venueId === v.id ? ' selected' : '') + '>' +
+        esc(v.name) + (v.address ? " · " + esc(v.address) : "") + "</option>"
+      ).join("") +
+      '</select>' +
+      (myRole === "admin" ? '<div class="hint">没有合适的场馆？<a href="#/venues">去维护</a></div>' : "") +
+      '</div>' +
+      '<div class="field"><label>报名方式</label><div class="segmented">' +
+      '<button data-signup="1" class="' + (draft.signup ? "on" : "") + '">报名制（生成链接）</button>' +
+      '<button data-signup="0" class="' + (!draft.signup ? "on" : "") + '">直接开打</button>' +
+      "</div></div>" +
+      '<div class="field"><label>规则</label>' + playRulesHTML(playOf(draft.mode)) + '</div>' +
+      '<div class="field"><label>类型</label><div class="segmented">' +
+      R.GROUPS.map(
+        g =>
+          '<button data-group="' + g.key + '" class="' + (draft.group === g.key ? 'on' : '') + '">' +
+          g.name + '</button>'
+      ).join('') +
+      '</div></div>' +
+      '<div class="field"><label>赛制</label><div class="mode-list">' +
+      modes.map(play => {
+        return (
+          '<button data-mode="' + esc(play.id) + '" class="' + (draft.mode === play.id ? 'on' : '') + '">' +
+          '<div class="n">' + esc(play.name) + '</div>' +
+          '<div class="i">' + esc(play.intro) + '</div></button>'
+        );
+      }).join('') +
+      '</div></div></div>';
+
+    html +=
+      '<div class="card">' +
+      '<div class="field"><label>局数</label><div class="segmented">' +
+      R.ROUNDS.map(
+        o =>
+          '<button data-rounds="' + o.value + '" class="' + (draft.rounds === o.value ? 'on' : '') + '">' +
+          o.name + '</button>'
+      ).join('') +
+      '</div></div>' +
+      '<div class="field"><label>分制</label><select id="balls">' +
+      R.BALLS.map(
+        b => '<option value="' + b + '"' + (draft.balls === b ? ' selected' : '') + '>' + R.ballsName(b) + '</option>'
+      ).join('') +
+      '</select></div>';
+
+    if (CHASE_MODES.indexOf(draft.mode) >= 0) {
+      html +=
+        '<div class="field"><label>记分方式</label><div class="segmented">' +
+        R.WHEEL_MODES.map(
+          o =>
+            '<button data-wheel="' + o.value + '" class="' + (draft.wheelMode === o.value ? 'on' : '') + '">' +
+            o.name + '</button>'
+        ).join('') +
+        '</div></div>';
+    }
+    if (['loop', 'doubleLoop', 'promote'].indexOf(draft.mode) >= 0) {
+      html +=
+        '<div class="field"><label>搭档方式</label><div class="segmented">' +
+        R.PARTNER_MODES.map(
+          o =>
+            '<button data-partner="' + o.value + '" class="' + (draft.partnerMode === o.value ? 'on' : '') + '">' +
+            o.name + '</button>'
+        ).join('') +
+        '</div></div>';
+    }
+    if (draft.mode === 'fixedRound' || draft.mode === 'singlesRound') {
+      html +=
+        '<div class="field"><label>每人 / 每对比赛次数</label>' +
+        '<input type="number" id="per" min="1" max="30" value="' + draft.matchesPerEntity + '"></div>';
+    }
+    if (draft.mode === 'arena' || draft.mode === 'singlesArena') {
+      html +=
+        '<div class="field"><label>擂主人数</label>' +
+        '<input type="number" id="kings" min="1" max="10" value="' + draft.arenaKings + '"></div>';
+    }
+    if (draft.mode === 'promote') {
+      html +=
+        '<div class="field"><label>小组人数</label>' +
+        '<input type="number" id="groupsize" min="2" max="8" value="' + draft.groupSize + '"></div>';
+    }
+    html +=
+      '<div class="field"><label>排名方式</label><select id="rankmode">' +
+      R.RANK_MODES.map(
+        o =>
+          '<option value="' + o.value + '"' + (draft.rankMode === o.value ? ' selected' : '') + '>' +
+          o.name + '</option>'
+      ).join('') +
+      '</select></div></div>';
+
+    html += draft.signup && !isTeam
+      ? '<div class="card"><div class="meta">报名制：选手通过报名链接加入，人齐后由你开始比赛并自动生成对阵。</div></div>'
+      : isTeam ? teamsForm() : playersForm();
+    html += '<button class="btn" id="create">生成对阵</button>';
+    view.innerHTML = html;
+    wireCreate();
+  }
+
+  function playersForm() {
+    return (
+      '<div class="card"><div class="field"><label>选手（' + draft.players.length + ' 人）</label>' +
+      '<div class="players">' +
+      draft.players.map(
+        (p, i) =>
+          '<div class="player-row"><span class="name">' + esc(p.name) + '</span>' +
+          '<span class="tag">' + (p.gender === 'F' ? '女' : '男') + ' · ' + p.level + '级</span>' +
+          '<button class="del" data-del="' + i + '">×</button></div>'
+      ).join('') +
+      '</div>' +
+      '<div class="player-add">' +
+      '<input type="text" id="pname" placeholder="姓名，可逗号批量">' +
+      '<select id="pgender"><option value="M">男</option><option value="F">女</option></select>' +
+      '<select id="plevel">' + levelOptions() + '</select>' +
+      '<button class="ghost" id="padd">添加</button></div>' +
+      '<div class="hint">批量：张三,李四,王五（按当前性别 / 等级添加）</div></div></div>'
+    );
+  }
+
+  function levelOptions() {
+    let out = '';
+    for (let i = 0; i <= 10; i++) out += '<option value="' + i + '">' + i + '级</option>';
+    return out;
+  }
+
+  function teamsForm() {
+    let html = '<div class="card"><div class="field"><label>队伍</label>';
+    draft.teams.forEach((team, ti) => {
+      html +=
+        '<div style="margin-bottom:12px">' +
+        '<input type="text" data-teamname="' + ti + '" value="' + esc(team.name) + '" style="margin-bottom:6px">' +
+        '<div class="players">' +
+        team.players
+          .map(
+            (p, pi) =>
+              '<div class="player-row"><span class="name">' + esc(p.name) + '</span>' +
+              '<span class="tag">' + (p.gender === 'F' ? '女' : '男') + '</span>' +
+              '<button class="del" data-delteam="' + ti + '" data-pi="' + pi + '">×</button></div>'
+          )
+          .join('') +
+        '</div>' +
+        '<div class="player-add">' +
+        '<input type="text" data-tname="' + ti + '" placeholder="姓名">' +
+        '<select data-tgender="' + ti + '"><option value="M">男</option><option value="F">女</option></select>' +
+        '<button class="ghost" data-tadd="' + ti + '">加入</button></div></div>';
+    });
+    if (draft.group === 'teams') {
+      html += '<button class="btn secondary" id="addteam">增加队伍</button>';
+    }
+    return html + '</div></div>';
+  }
+
+  function wireCreate() {
+    view.querySelector('#race-name').oninput = e => {
+      draft.name = e.target.value;
+    };
+    view.querySelectorAll("[data-signup]").forEach(btn => {
+      btn.onclick = () => {
+        const next = btn.dataset.signup === "1";
+        if (draft.signup === next) return;
+        draft.signup = next;
+        renderCreate();
+      };
+    });
+    view.querySelectorAll("[data-group]").forEach(btn => {
+      btn.onclick = () => {
+        if (draft.group === btn.dataset.group) return;
+        draft.group = btn.dataset.group;
+        draft.mode = Object.keys(R.MODES).filter(k => R.MODES[k].group === draft.group)[0];
+        renderCreate();
+      };
+    });
+    view.querySelectorAll("[data-mode]").forEach(btn => {
+      btn.onclick = () => {
+        draft.mode = btn.dataset.mode;
+        const d = playOf(draft.mode).defaults || {};
+        if (d.rounds) draft.rounds = d.rounds;
+        if (d.balls) draft.balls = d.balls;
+        if (d.rankMode) draft.rankMode = d.rankMode;
+        if (d.matchesPerEntity) draft.matchesPerEntity = d.matchesPerEntity;
+        if (d.arenaKings) draft.arenaKings = d.arenaKings;
+        if (d.partnerMode) draft.partnerMode = d.partnerMode;
+        renderCreate();
+      };
+    });
+    view.querySelectorAll("[data-rounds]").forEach(btn => {
+      btn.onclick = () => {
+        const next = Number(btn.dataset.rounds);
+        if (draft.rounds === next) return;
+        draft.rounds = next;
+        renderCreate();
+      };
+    });
+    view.querySelectorAll('[data-wheel]').forEach(btn => {
+      btn.onclick = () => {
+        draft.wheelMode = btn.dataset.wheel;
+        renderCreate();
+      };
+    });
+    view.querySelectorAll('[data-partner]').forEach(btn => {
+      btn.onclick = () => {
+        draft.partnerMode = btn.dataset.partner;
+        renderCreate();
+      };
+    });
+
+    const dateInput = view.querySelector("#race-date");
+    if (dateInput) dateInput.oninput = () => { draft.date = dateInput.value; };
+    const venueSelect = view.querySelector("#race-venue");
+    if (venueSelect) venueSelect.onchange = () => { draft.venueId = venueSelect.value; };
+
+    const balls = view.querySelector('#balls');
+    if (balls) balls.onchange = () => {
+      draft.balls = Number(balls.value);
+      renderCreate();
+    };
+    const rankmode = view.querySelector('#rankmode');
+    if (rankmode) rankmode.onchange = () => {
+      draft.rankMode = rankmode.value;
+    };
+    const per = view.querySelector('#per');
+    if (per) per.onchange = () => {
+      draft.matchesPerEntity = Number(per.value) || 1;
+    };
+    const kings = view.querySelector('#kings');
+    if (kings) kings.onchange = () => {
+      draft.arenaKings = Number(kings.value) || 1;
+    };
+    const groupsize = view.querySelector('#groupsize');
+    if (groupsize) groupsize.onchange = () => {
+      draft.groupSize = Number(groupsize.value) || 4;
+    };
+
+    const add = view.querySelector('#padd');
+    if (add) add.onclick = () => {
+      const raw = view.querySelector('#pname').value.trim();
+      if (!raw) return;
+      raw.split(/[,，\s]+/).filter(Boolean).forEach(name => {
+        draft.players.push({
+          id: S.uid('p'),
+          name,
+          gender: view.querySelector('#pgender').value,
+          level: Number(view.querySelector('#plevel').value)
+        });
+      });
+      renderCreate();
+    };
+    view.querySelectorAll('[data-del]').forEach(btn => {
+      btn.onclick = () => {
+        draft.players.splice(Number(btn.dataset.del), 1);
+        renderCreate();
+      };
+    });
+
+    view.querySelectorAll('[data-teamname]').forEach(input => {
+      input.oninput = () => {
+        draft.teams[Number(input.dataset.teamname)].name = input.value;
+      };
+    });
+    view.querySelectorAll('[data-tadd]').forEach(btn => {
+      btn.onclick = () => {
+        const ti = Number(btn.dataset.tadd);
+        const raw = view.querySelector('[data-tname="' + ti + '"]').value.trim();
+        if (!raw) return;
+        raw.split(/[,，\s]+/).filter(Boolean).forEach(name => {
+          draft.teams[ti].players.push({
+            id: S.uid('p'),
+            name,
+            gender: view.querySelector('[data-tgender="' + ti + '"]').value,
+            level: 0
+          });
+        });
+        renderCreate();
+      };
+    });
+    view.querySelectorAll('[data-delteam]').forEach(btn => {
+      btn.onclick = () => {
+        draft.teams[Number(btn.dataset.delteam)].players.splice(Number(btn.dataset.pi), 1);
+        renderCreate();
+      };
+    });
+    const addteam = view.querySelector('#addteam');
+    if (addteam) addteam.onclick = () => {
+      if (draft.teams.length >= 12) return modal('最多 12 支队伍');
+      draft.teams.push({ name: String.fromCharCode(65 + draft.teams.length) + ' 队', players: [] });
+      renderCreate();
+    };
+
+    view.querySelector('#create').onclick = createRace;
+  }
+
+  async function createRace() {
+    const play = playOf(draft.mode);
+    const isTeam = draft.group === 'match' || draft.group === 'teams';
+    let players = draft.players.slice();
+    let teams = draft.teams.map((t, i) => ({
+      name: t.name || i + 1 + '队',
+      players: t.players.map(p => p.id)
+    }));
+
+    if (isTeam) {
+      if (teams.length < 2) return modal('至少需要 2 支队伍');
+      if (draft.group === 'teams' && teams.length < 3) return modal('团体赛至少需要 3 支队伍');
+      const need = draft.mode === 'singlesMatch' || draft.mode === 'fixedMatch' ? 1 : 2;
+      for (const team of teams) {
+        if (team.players.length < need) return modal('「' + team.name + '」至少需要 ' + need + ' 名选手');
+      }
+      players = [];
+      draft.teams.forEach(t => t.players.forEach(p => players.push(p)));
+    } else if (!draft.signup && players.length < (play.min || 2)) {
+      return modal('至少需要 ' + (play.min || 2) + ' 名选手');
+    }
+
+    let venue = null;
+    if (draft.venueId) {
+      venue = (VENUE_CACHE || []).find((v) => v.id === draft.venueId) || null;
+    }
+
+    const race = {
+      id: S.uid('race'),
+      name: draft.name || '未命名比赛',
+      playName: play.name,
+      playRules: play.rules || {},
+      date: draft.date || null,
+      venueId: venue ? venue.id : null,
+      venue: venue
+        ? {
+            name: venue.name,
+            address: venue.address,
+            lat: venue.lat,
+            lng: venue.lng,
+            coordType: venue.coord_type || 'gcj02'
+          }
+        : null,
+      mode: draft.mode,
+      group: draft.group,
+      rounds: draft.rounds,
+      balls: draft.balls,
+      wheelMode: draft.wheelMode,
+      partnerMode: draft.partnerMode,
+      rankMode: draft.rankMode,
+      matchesPerEntity: draft.matchesPerEntity,
+      arenaKings: draft.arenaKings,
+      groupSize: draft.groupSize,
+      groupsValid: 3,
+      players,
+      teams,
+      matches: [],
+      createdAt: Date.now()
+    };
+    // 报名制：等报名结束再开始；直接开打：创建即进行中
+    race.status = draft.signup ? "draft" : "playing";
+
+    const generated = draft.signup ? [] : BA.plays.generate(race);
+    race.matches = generated.map(m => ({
+      id: S.uid('m'),
+      round: m.round,
+      court: m.court,
+      side1: m.side1,
+      side2: m.side2,
+      teamA: m.teamA,
+      teamB: m.teamB,
+      scores: [],
+      scoreAll: null,
+      crt: [0, 0],
+      status: 'pending'
+    }));
+
+    await S.createRace(race);
+    draft = null;
+    go('#/race/' + race.id);
+  }
+
+  /* ---------------- 场馆维护（管理员） ---------------- */
+
+  async function renderVenues() {
+    topbar.innerHTML = topbarHTML({
+      title: "场馆",
+      back: true,
+      action: myRole === "admin" ? "新增" : ""
+    });
+    wireTopbar({
+      onAction: () => {
+        draftVenue = { name: "", address: "", lat: "", lng: "", note: "" };
+        renderVenues();
+      }
+    });
+
+    if (myRole !== "admin") {
+      view.innerHTML = '<div class="empty">需要管理员权限</div>';
+      return;
+    }
+    const crossLink =
+      '<div class="hint" style="margin-bottom:12px">' +
+      '<a href="#/formats">玩法管理 →</a></div>';
+
+    let venues = [];
+    try {
+      venues = await S.venues();
+    } catch (e) {
+      venues = [];
+    }
+
+    const v = draftVenue;
+    let html = crossLink;
+    html += venues.length
+      ? venues
+          .map(
+            item =>
+              '<div class="card"><h3>' + esc(item.name) + "</h3>" +
+              '<div class="meta">' + esc(item.address || "未填写地址") + "</div>" +
+              '<div class="meta" style="margin-top:4px">' +
+              (item.lat != null && item.lng != null
+                ? "坐标 " + item.lat + ", " + item.lng + "（" + esc(item.coord_type) + "）"
+                : "无坐标（导航将复制地址）") +
+              "</div>" +
+              '<div class="tabs" style="margin-top:10px">' +
+              '<button data-edit="' + esc(item.id) + '">编辑</button>' +
+              '<button data-del-venue="' + esc(item.id) + '">删除</button></div></div>'
+          )
+          .join("")
+      : '<div class="empty">还没有场馆，点右上角「新增」</div>';
+
+    if (v) {
+      html +=
+        '<div class="card"><h3>' + (v.id ? "编辑场馆" : "新增场馆") + "</h3>" +
+        '<div class="field"><label>场馆名</label>' +
+        '<input type="text" id="v-name" value="' + esc(v.name) + '" placeholder="城东体育馆"></div>' +
+        '<div class="field"><label>地址</label>' +
+        '<input type="text" id="v-address" value="' + esc(v.address) + '" placeholder="杭州市…"></div>' +
+        '<div class="field"><label>纬度 latitude（高德/腾讯坐标）</label>' +
+        '<input type="text" id="v-lat" value="' + esc(v.lat) + '" placeholder="30.2741"></div>' +
+        '<div class="field"><label>经度 longitude</label>' +
+        '<input type="text" id="v-lng" value="' + esc(v.lng) + '" placeholder="120.1551"></div>' +
+        '<div class="field"><label>备注</label>' +
+        '<input type="text" id="v-note" value="' + esc(v.note) + '" placeholder="3 号场地"></div>' +
+        '<div class="hint">坐标可在地图 App 里长按地点复制（高德/腾讯为 gcj02）；只填地址时，导航会复制地址。</div>' +
+        '<button class="btn" id="v-save">保存</button>' +
+        '<button class="btn secondary" id="v-cancel">取消</button></div>';
+    }
+
+    view.innerHTML = html;
+
+    view.querySelectorAll("[data-edit]").forEach(btn => {
+      btn.onclick = () => {
+        const item = venues.find(x => x.id === btn.dataset.edit);
+        if (!item) return;
+        draftVenue = {
+          id: item.id,
+          name: item.name,
+          address: item.address || "",
+          lat: item.lat != null ? item.lat : "",
+          lng: item.lng != null ? item.lng : "",
+          note: item.note || ""
+        };
+        renderVenues();
+      };
+    });
+
+    view.querySelectorAll("[data-del-venue]").forEach(btn => {
+      btn.onclick = () =>
+        modal("删除该场馆？", [
+          { label: "取消" },
+          {
+            label: "删除",
+            primary: true,
+            fn: async () => {
+              try {
+                await S.removeVenue(btn.dataset.delVenue);
+                if (draftVenue && draftVenue.id === btn.dataset.delVenue) draftVenue = null;
+                renderVenues();
+              } catch (e) {
+                modal((e && e.detail) || "删除失败");
+              }
+            }
+          }
+        ]);
+    });
+
+    const save = view.querySelector("#v-save");
+    if (save) {
+      save.onclick = async () => {
+        const payload = {
+          id: v.id,
+          name: view.querySelector("#v-name").value.trim(),
+          address: view.querySelector("#v-address").value.trim(),
+          lat: view.querySelector("#v-lat").value.trim() === "" ? null : Number(view.querySelector("#v-lat").value),
+          lng: view.querySelector("#v-lng").value.trim() === "" ? null : Number(view.querySelector("#v-lng").value),
+          note: view.querySelector("#v-note").value.trim()
+        };
+        if (!payload.name) return modal("请填写场馆名");
+        if ((payload.lat == null) !== (payload.lng == null)) return modal("经纬度需要同时填写");
+        try {
+          await S.saveVenue(payload);
+          draftVenue = null;
+          renderVenues();
+        } catch (e) {
+          modal((e && e.detail) || "保存失败");
+        }
+      };
+      const cancel = view.querySelector("#v-cancel");
+      if (cancel) cancel.onclick = () => { draftVenue = null; renderVenues(); };
+    }
+  }
+
+  /* ---------------- 玩法管理（管理员） ---------------- */
+
+  let draftPlay = null;
+
+  const LLM_PROMPT = [
+    "请在当前代码仓库新增一个羽毛球玩法（不要改其它玩法）：",
+    "1. 新建 shared/plays/<id>.js，导出 { id, name, group, min, max, intro, tags, rules, defaults, schedule }；",
+    "   group 取 doubles|singles|match|teams；rules 必须写全 people/how/groups/end/score 五段中文说明；",
+    "   schedule(race, fmt) 返回 [{ round, court, side1:[playerId], side2:[playerId] }]，可复用 fmt.circleRounds /",
+    "   fmt.greedyCourts / fmt.roundRobinMatches / fmt.fixedCountMatches / fmt.arenaMatches 等原语。",
+    "2. 在 shared/plays/registry.json 的 plays 数组里加一行 { \"id\": \"<id>\", \"file\": \"<id>.js\" }。",
+    "3. 在 tests/logic.test.js 补一条断言（生成数量 + 关键不变量），跑 node tests/logic.test.js。",
+    "4. 在 docs/llm/玩法开发指南.md 的「已实现玩法」表里补一行。",
+    "玩法需求示例：8 人、双打、每人和其余人各搭档一次、一局定胜负、每局 15 分、先到 15 分且领先 2 分、30 分封顶。"
+  ].join("\n");
+
+  function showLlmGuide() {
+    modal(LLM_PROMPT, [
+      { label: "复制给 LLM", fn: () => copyText(LLM_PROMPT) },
+      { label: "知道了", primary: true }
+    ]);
+  }
+
+  async function renderFormats() {
+    topbar.innerHTML = topbarHTML({
+      title: "玩法管理",
+      back: true,
+      action: myRole === "admin" ? "新增玩法" : ""
+    });
+    wireTopbar({ onAction: showLlmGuide });
+
+    if (myRole !== "admin") {
+      view.innerHTML = '<div class="empty">需要管理员权限</div>';
+      return;
+    }
+
+    let html =
+      '<div class="hint" style="margin-bottom:12px">' +
+      '玩法由代码实现（shared/plays/*.js）；这里可以调整展示文案、默认规则和启用状态，' +
+      '新增玩法点右上角交给 LLM 生成。<a href="#/venues">场馆管理 →</a></div>';
+
+    html += PLAYS.map((play) => {
+      const badges =
+        '<span class="badge">' + esc(play.group) + "</span>" +
+        (play.enabled === false ? ' <span class="badge">已停用</span>' : "") +
+        (play.legacy ? ' <span class="badge">内置</span>' : "") +
+        (play.hasOverride ? ' <span class="badge">已改</span>' : "");
+      return (
+        '<div class="card"><h3>' + esc(play.name) + " " + badges + "</h3>" +
+        '<div class="meta">' + esc(play.intro) + "</div>" +
+        playRulesHTML(play) +
+        (play.note ? '<div class="hint">备注：' + esc(play.note) + "</div>" : "") +
+        '<div class="tabs" style="margin-top:10px">' +
+        '<button data-play-edit="' + esc(play.id) + '">编辑</button>' +
+        '<button data-play-toggle="' + esc(play.id) + '">' +
+        (play.enabled === false ? "启用" : "停用") + "</button>" +
+        (play.hasOverride
+          ? '<button data-play-reset="' + esc(play.id) + '">恢复默认</button>'
+          : "") +
+        "</div></div>"
+      );
+    }).join("");
+
+    if (draftPlay) {
+      const d = draftPlay;
+      html +=
+        '<div class="card"><h3>编辑玩法：' + esc(d.name) + "</h3>" +
+        '<div class="field"><label>名称</label><input type="text" id="p-name" value="' + esc(d.name) + '"></div>' +
+        '<div class="field"><label>一句话简介</label><input type="text" id="p-intro" value="' + esc(d.intro) + '"></div>' +
+        '<div class="field"><label>默认局数</label><select id="p-rounds">' +
+        R.ROUNDS.map(o => '<option value="' + o.value + '"' + (d.defaults.rounds === o.value ? " selected" : "") + ">" + o.name + "</option>").join("") +
+        "</select></div>" +
+        '<div class="field"><label>默认分制</label><select id="p-balls">' +
+        R.BALLS.map(b => '<option value="' + b + '"' + (d.defaults.balls === b ? " selected" : "") + ">" + R.ballsName(b) + "</option>").join("") +
+        "</select></div>" +
+        '<div class="field"><label>默认排名方式</label><select id="p-rank">' +
+        R.RANK_MODES.map(o => '<option value="' + o.value + '"' + (d.defaults.rankMode === o.value ? " selected" : "") + ">" + o.name + "</option>").join("") +
+        "</select></div>" +
+        [["people", "参与人数"], ["how", "怎么玩"], ["groups", "怎么分组"], ["end", "怎么结束"], ["score", "怎么计分"]]
+          .map(([k, label]) =>
+            '<div class="field"><label>' + label + '</label>' +
+            '<input type="text" id="p-rule-' + k + '" value="' + esc((d.rules || {})[k] || "") + '"></div>'
+          )
+          .join("") +
+        '<div class="field"><label>备注</label><input type="text" id="p-note" value="' + esc(d.note || "") + '"></div>' +
+        '<button class="btn" id="p-save">保存</button>' +
+        '<button class="btn secondary" id="p-cancel">取消</button></div>';
+    }
+
+    view.innerHTML = html;
+    view.querySelectorAll("[data-play-edit]").forEach((btn) => {
+      btn.onclick = () => {
+        const play = PLAYS.find((p) => p.id === btn.dataset.playEdit);
+        draftPlay = Object.assign({}, play, {
+          rules: Object.assign({}, play.rules || {}),
+          defaults: Object.assign({}, play.defaults || {})
+        });
+        renderFormats();
+      };
+    });
+    view.querySelectorAll("[data-play-toggle]").forEach((btn) => {
+      btn.onclick = async () => {
+        const play = PLAYS.find((p) => p.id === btn.dataset.playToggle);
+        try {
+          await S.saveFormat(play.id, {
+            enabled: play.enabled === false,
+            name: play.name,
+            intro: play.intro,
+            defaults: play.defaults,
+            rules: play.rules,
+            note: play.note
+          });
+          await loadPlays();
+    try {
+      VENUE_CACHE = await S.venues();
+    } catch (e) {
+      VENUE_CACHE = [];
+    }
+          renderFormats();
+        } catch (e) {
+          modal((e && e.detail) || "保存失败");
+        }
+      };
+    });
+    view.querySelectorAll("[data-play-reset]").forEach((btn) => {
+      btn.onclick = () =>
+        modal("恢复该玩法的默认展示与规则？", [
+          { label: "取消" },
+          {
+            label: "恢复",
+            primary: true,
+            fn: async () => {
+              try {
+                await S.resetFormat(btn.dataset.playReset);
+                await loadPlays();
+    try {
+      VENUE_CACHE = await S.venues();
+    } catch (e) {
+      VENUE_CACHE = [];
+    }
+                draftPlay = null;
+                renderFormats();
+              } catch (e) {
+                modal((e && e.detail) || "恢复失败");
+              }
+            }
+          }
+        ]);
+    });
+
+    const save = view.querySelector("#p-save");
+    if (save) {
+      save.onclick = async () => {
+        const payload = {
+          enabled: draftPlay.enabled !== false,
+          name: view.querySelector("#p-name").value.trim() || draftPlay.name,
+          intro: view.querySelector("#p-intro").value.trim(),
+          defaults: {
+            rounds: Number(view.querySelector("#p-rounds").value),
+            balls: Number(view.querySelector("#p-balls").value),
+            rankMode: view.querySelector("#p-rank").value
+          },
+          rules: {
+            people: view.querySelector("#p-rule-people").value.trim(),
+            how: view.querySelector("#p-rule-how").value.trim(),
+            groups: view.querySelector("#p-rule-groups").value.trim(),
+            end: view.querySelector("#p-rule-end").value.trim(),
+            score: view.querySelector("#p-rule-score").value.trim()
+          },
+          note: view.querySelector("#p-note").value.trim()
+        };
+        try {
+          await S.saveFormat(draftPlay.id, payload);
+          draftPlay = null;
+          await loadPlays();
+    try {
+      VENUE_CACHE = await S.venues();
+    } catch (e) {
+      VENUE_CACHE = [];
+    }
+          renderFormats();
+        } catch (e) {
+          modal((e && e.detail) || "保存失败");
+        }
+      };
+      view.querySelector("#p-cancel").onclick = () => {
+        draftPlay = null;
+        renderFormats();
+      };
+    }
+  }
+
+  /* ---------------- 战绩 ---------------- */
+
+  async function renderStats() {
+    topbar.innerHTML = topbarHTML({ title: '战绩', brand: true });
+    wireTopbar({});
+
+    const me = S.me();
+    const stats = K.personalStats(S.races(), me);
+    const pct = s => (s.alls ? Math.round((s.wins / s.alls) * 100) + '%' : '—');
+
+    view.innerHTML =
+      '<div class="card">' +
+      '<div class="field"><label>我的名字（与比赛中的选手名一致）</label>' +
+      '<input type="text" id="me" value="' + esc(me) + '" placeholder="输入名字"></div>' +
+      '<div class="meta">跨所有比赛的统计</div></div>' +
+      '<div class="stat-grid">' +
+      statCard('总场次', stats.total.alls) +
+      statCard('胜率', pct(stats.total)) +
+      statCard('单打胜率', pct(stats.singles)) +
+      statCard('双打胜率', pct(stats.doubles)) +
+      '</div>' +
+      (me
+        ? '<div class="card" style="margin-top:12px"><h3>' + esc(me) + '</h3>' +
+          '<div class="meta">' + stats.total.wins + ' 胜 / ' + stats.total.fail + ' 负' +
+          (stats.total.even ? ' / ' + stats.total.even + ' 平' : '') +
+          ' · 共 ' + stats.rounds + ' 局</div></div>'
+        : '');
+
+    const input = view.querySelector('#me');
+    input.onchange = () => {
+      S.setMe(input.value.trim());
+      renderStats();
+    };
+  }
+
+  function statCard(label, value) {
+    return '<div class="stat"><div class="k">' + esc(label) + '</div><div class="v">' + esc(value) + '</div></div>';
+  }
+
+  /* ---------------- 启动 ---------------- */
+
+  global.addEventListener('hashchange', route);
+
+  function wxTried() {
+    try {
+      return sessionStorage.getItem("gorilla_wx_tried") === "1";
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function markWxTried() {
+    try {
+      sessionStorage.setItem("gorilla_wx_tried", "1");
+    } catch (e) {
+      /* 忽略 */
+    }
+  }
+
+  async function serverFeatures() {
+    try {
+      const res = await fetch("/api/health");
+      const data = await res.json();
+      return data.features || {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  (async () => {
+    const params = new URLSearchParams(location.search);
+    const token = params.get("token");
+    if (token) {
+      S.adoptToken(token);
+      params.delete("token");
+      const query = params.toString();
+      history.replaceState(null, "", location.pathname + (query ? "?" + query : "") + location.hash);
+    } else if (!S.hasToken() && BA.nav.isWechat() && !wxTried()) {
+      // 微信内且服务端配置了公众号：静默走网页授权
+      const features = await serverFeatures();
+      if (features.wechatOAuth) {
+        markWxTried();
+        const back = location.pathname + location.hash;
+        location.replace("/api/auth/wechat/start?redirect=" + encodeURIComponent(back));
+        return;
+      }
+    }
+
+    serverOk = await S.init();
+    try {
+      myRole = (await S.meInfo()).role || "user";
+    } catch (e) {
+      myRole = "user";
+    }
+    if (BA.plays && BA.plays.ready) {
+      try {
+        await BA.plays.ready;
+      } catch (e) {
+        /* 玩法模块加载失败时回退到内置赛制 */
+      }
+    }
+    await loadPlays();
+    try {
+      VENUE_CACHE = await S.venues();
+    } catch (e) {
+      VENUE_CACHE = [];
+    }
+    await S.pull();
+    route();
+  })();
+})(window);

@@ -1,0 +1,40 @@
+{
+  "plays": [
+    {
+      "id": "eight",
+      "file": "eight.js"
+    },
+    {
+      "id": "mixRound",
+      "file": "mixRound.js"
+    },
+    {
+      "id": "weakStrong",
+      "file": "weakStrong.js"
+    },
+    {
+      "id": "fixedRound",
+      "file": "fixedRound.js"
+    },
+    {
+      "id": "singlesRound",
+      "file": "singlesRound.js"
+    },
+    {
+      "id": "loop",
+      "file": "loop.js"
+    },
+    {
+      "id": "doubleLoop",
+      "file": "doubleLoop.js"
+    },
+    {
+      "id": "arena",
+      "file": "arena.js"
+    },
+    {
+      "id": "chase",
+      "file": "chase.js"
+    }
+  ]
+}

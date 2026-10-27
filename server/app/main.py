@@ -1,0 +1,654 @@
+"""猩球 · 羽球局 服务端：比赛文档、记分提交、排名与战绩。
+
+启动：
+    cd server && python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+鉴权：Authorization: Bearer <token>（POST /api/auth/login 获取）。
+小程序端在 utils/config.js 里把 apiBase 指向本服务即可。
+"""
+
+import hashlib
+import json
+import os
+import secrets
+import time
+import urllib.parse
+import urllib.request
+import uuid
+from contextlib import asynccontextmanager
+
+from pathlib import Path
+
+# 可选：从 server/.env 读取配置（没装 python-dotenv 也能跑，只用系统环境变量）
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+except Exception:  # pragma: no cover - 仅影响便捷性
+    pass
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict, Field
+
+from . import db, rules
+
+WECHAT_APPID = os.environ.get("GORILLA_WECHAT_APPID", "")
+WECHAT_SECRET = os.environ.get("GORILLA_WECHAT_SECRET", "")
+OAUTH_CALLBACK = os.environ.get("GORILLA_OAUTH_CALLBACK", "")
+PUBLIC_BASE = os.environ.get("GORILLA_PUBLIC_BASE", "")
+ADMIN_DEVICES = {d.strip() for d in os.environ.get("GORILLA_ADMIN_DEVICES", "").split(",") if d.strip()}
+
+# 网页授权 state -> 回跳地址（单进程内存，重启失效；生产可换 Redis）
+OAUTH_STATES: dict[str, tuple[str, int]] = {}
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    db.init()
+    yield
+
+
+app = FastAPI(title="猩球 · 羽球局 API", version="1.0.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------------------------------------------------------------- 模型
+
+class LoginIn(BaseModel):
+    deviceId: str | None = None
+    nickname: str | None = None
+
+
+class Player(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    id: str
+    name: str
+    gender: str = "M"
+    level: int = 0
+
+
+class Team(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    name: str
+    players: list[str] = Field(default_factory=list)
+
+
+class Match(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    id: str
+    round: int = 1
+    court: int = 1
+    side1: list[str] = Field(default_factory=list)
+    side2: list[str] = Field(default_factory=list)
+    teamA: int | None = None
+    teamB: int | None = None
+    scores: list[list[int]] = Field(default_factory=list)
+    scoreAll: list[int] | None = None
+    status: str = "pending"
+
+
+class VenueIn(BaseModel):
+    id: str | None = None
+    name: str
+    address: str = ""
+    lat: float | None = None
+    lng: float | None = None
+    coordType: str = "gcj02"
+    note: str = ""
+
+
+class FormatOverrideIn(BaseModel):
+    enabled: bool = True
+    name: str | None = None
+    intro: str | None = None
+    defaults: dict | None = None
+    rules: dict | None = None
+    note: str = ""
+
+
+class OpenIn(BaseModel):
+    maxPlayers: int = 0
+
+
+class JoinIn(BaseModel):
+    name: str
+    gender: str = "M"
+    level: int = 0
+
+
+class StartIn(BaseModel):
+    players: list[Player] = Field(default_factory=list)
+    matches: list[Match] = Field(default_factory=list)
+
+
+class RaceIn(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    id: str
+    name: str = "未命名比赛"
+    mode: str
+    group: str = "doubles"
+    rounds: int = 3
+    balls: int = 21
+    wheelMode: str = "isolate"
+    partnerMode: str = "random"
+    rankMode: str = "pointFirst"
+    matchesPerEntity: int = 3
+    arenaKings: int = 1
+    groupSize: int = 4
+    groupsValid: int = 3
+    date: str | None = None
+    playName: str | None = None
+    playRules: dict | None = None
+    venueId: str | None = None
+    venue: dict | None = None
+    players: list[Player] = Field(default_factory=list)
+    teams: list[Team] = Field(default_factory=list)
+    matches: list[Match] = Field(default_factory=list)
+    createdAt: int | None = None
+
+
+# ---------------------------------------------------------------- 鉴权
+
+def current_user(authorization: str | None = Header(default=None)) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="缺少登录令牌")
+    user_id = db.user_by_token(authorization[7:].strip())
+    if not user_id:
+        raise HTTPException(status_code=401, detail="令牌无效或已过期")
+    return user_id
+
+
+def require_admin(user_id: str = Depends(current_user)) -> str:
+    user = db.get_user(user_id)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    return user_id
+
+
+def _assign_role(user_id: str, device_id: str | None) -> None:
+    if device_id and device_id in ADMIN_DEVICES:
+        db.set_role(user_id, "admin")
+        return
+    if not db.has_admin():
+        # 首次部署还没有管理员时，第一个登录的用户成为管理员
+        db.set_role(user_id, "admin")
+
+
+def _oauth_openid(code: str) -> str:
+    """用网页授权的 code 换 openid（snsapi_base 静默授权）。"""
+    if not (WECHAT_APPID and WECHAT_SECRET):
+        raise HTTPException(status_code=400, detail="服务端未配置微信网页授权")
+    query = urllib.parse.urlencode(
+        {
+            "appid": WECHAT_APPID,
+            "secret": WECHAT_SECRET,
+            "code": code,
+            "grant_type": "authorization_code",
+        }
+    )
+    try:
+        with urllib.request.urlopen(
+            "https://api.weixin.qq.com/sns/oauth2/access_token?" + query, timeout=5
+        ) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=502, detail="微信授权服务不可用")
+    openid = payload.get("openid")
+    if not openid:
+        raise HTTPException(status_code=401, detail=payload.get("errmsg") or "微信授权失败")
+    return openid
+
+
+def _with_token(target: str, token: str) -> str:
+    """把 token 插到 hash 之前：/h5/#/join/X -> /h5/?token=..#/join/X"""
+    path, _, frag = target.partition("#")
+    sep = "&" if "?" in path else "?"
+    url = path + sep + "token=" + token
+    return url + ("#" + frag if frag else "")
+
+
+# ---------------------------------------------------------------- 接口
+
+@app.get("/api/health")
+def health() -> dict:
+    return {
+        "ok": True,
+        "service": "gorilla-badminton",
+        "version": app.version,
+        "features": {
+            "wechatOAuth": bool(WECHAT_APPID and WECHAT_SECRET and OAUTH_CALLBACK),
+            "wechatJssdk": bool(WECHAT_APPID and WECHAT_SECRET),
+        },
+    }
+
+
+@app.get("/api/auth/wechat/start")
+def wechat_start(redirect: str = "/h5/") -> RedirectResponse:
+    """跳转到微信网页授权（需认证服务号 + 网页授权域名）。"""
+    if not (WECHAT_APPID and WECHAT_SECRET and OAUTH_CALLBACK):
+        raise HTTPException(status_code=400, detail="服务端未配置微信网页授权")
+    target = redirect if redirect.startswith("/") else "/h5/"
+    state = secrets.token_urlsafe(12)
+    OAUTH_STATES[state] = (target, db.now())
+    query = urllib.parse.urlencode(
+        {
+            "appid": WECHAT_APPID,
+            "redirect_uri": OAUTH_CALLBACK,
+            "response_type": "code",
+            "scope": "snsapi_base",
+            "state": state,
+        }
+    )
+    return RedirectResponse("https://open.weixin.qq.com/connect/oauth2/authorize?" + query + "#wechat_redirect")
+
+
+@app.get("/api/auth/wechat/callback")
+def wechat_callback(code: str, state: str) -> RedirectResponse:
+    entry = OAUTH_STATES.pop(state, None)
+    if not entry:
+        raise HTTPException(status_code=400, detail="授权状态失效，请重新进入")
+    target, created = entry
+    if db.now() - created > 10 * 60 * 1000:
+        raise HTTPException(status_code=400, detail="授权超时，请重新进入")
+    openid = _oauth_openid(code)
+    user_id = "wx_" + openid
+    db.upsert_user(user_id)
+    token = secrets.token_urlsafe(24)
+    db.create_token(token, user_id)
+    return RedirectResponse(_with_token(target, token))
+
+
+@app.post("/api/auth/login")
+def login(body: LoginIn) -> dict:
+    # 设备号登录：非微信环境，或微信授权不可用时的兜底
+    user_id = "dev_" + (body.deviceId or uuid.uuid4().hex[:12])
+    db.upsert_user(user_id, body.nickname)
+    _assign_role(user_id, body.deviceId)
+    token = secrets.token_urlsafe(24)
+    db.create_token(token, user_id)
+    user = db.get_user(user_id) or {}
+    return {
+        "token": token,
+        "user": {"id": user_id, "nickname": body.nickname or "", "role": user.get("role", "user")},
+    }
+
+
+@app.get("/api/me")
+def me(user_id: str = Depends(current_user)) -> dict:
+    user = db.get_user(user_id) or {}
+    return {"id": user_id, "nickname": user.get("nickname") or "", "role": user.get("role", "user")}
+
+
+# ---------------------------------------------------------------- 场馆
+
+@app.get("/api/venues")
+def venues(user_id: str = Depends(current_user)) -> dict:
+    return {"venues": db.list_venues()}
+
+
+@app.post("/api/venues")
+def create_venue(body: VenueIn, user_id: str = Depends(require_admin)) -> dict:
+    venue = body.model_dump()
+    venue["id"] = venue.get("id") or "v_" + uuid.uuid4().hex[:10]
+    return db.save_venue(venue, user_id)
+
+
+@app.put("/api/venues/{venue_id}")
+def update_venue(venue_id: str, body: VenueIn, user_id: str = Depends(require_admin)) -> dict:
+    venue = body.model_dump()
+    venue["id"] = venue_id
+    return db.save_venue(venue, user_id)
+
+
+@app.delete("/api/venues/{venue_id}")
+def remove_venue(venue_id: str, user_id: str = Depends(require_admin)) -> dict:
+    if not db.delete_venue(venue_id):
+        raise HTTPException(status_code=404, detail="场馆不存在")
+    return {"ok": True}
+
+
+@app.get("/api/races")
+def list_races(full: bool = False, user_id: str = Depends(current_user)) -> dict:
+    summaries = db.list_races(user_id)
+    if not full:
+        return {"races": summaries}
+    return {"races": [db.get_race(item["id"]) for item in summaries]}
+
+
+@app.post("/api/races")
+def create_race(race: RaceIn, user_id: str = Depends(current_user)) -> dict:
+    doc = race.model_dump()
+    existing = db.get_race(doc["id"])
+    if existing and existing.get("_ownerId") != user_id:
+        raise HTTPException(status_code=409, detail="比赛 ID 已被占用")
+    doc.setdefault("createdAt", db.now())
+    return db.save_race(user_id, doc)
+
+
+CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def _new_join_code() -> str:
+    return "".join(secrets.choice(CODE_ALPHABET) for _ in range(6))
+
+
+def _race_for_view(race: dict) -> dict:
+    """对外的比赛视图：去掉服务端内部字段。"""
+    doc = {k: v for k, v in race.items() if not k.startswith("_")}
+    return doc
+
+
+@app.post("/api/races/{race_id}/open")
+def open_signup(
+    race_id: str, body: OpenIn | None = None, user_id: str = Depends(current_user)
+) -> dict:
+    race = db.get_race(race_id)
+    if not race:
+        raise HTTPException(status_code=404, detail="比赛不存在")
+    if race.get("_ownerId") != user_id:
+        raise HTTPException(status_code=403, detail="只有创建者可以开放报名")
+    if race.get("status") in ("playing", "done"):
+        raise HTTPException(status_code=409, detail="比赛已开始或已结束")
+    race["joinCode"] = race.get("joinCode") or _new_join_code()
+    race["status"] = "open"
+    if body and body.maxPlayers:
+        race["maxPlayers"] = body.maxPlayers
+    race.setdefault("maxPlayers", 0)
+    return _race_for_view(db.save_race(user_id, race))
+
+
+@app.get("/api/join/{code}")
+def join_info(code: str, user_id: str = Depends(current_user)) -> dict:
+    race = db.get_race_by_code(code)
+    if not race:
+        raise HTTPException(status_code=404, detail="报名链接无效或已关闭")
+    participants = db.list_participants(race["id"])
+    return {
+        "race": {
+            "id": race["id"],
+            "name": race.get("name"),
+            "mode": race.get("mode"),
+            "rounds": race.get("rounds"),
+            "balls": race.get("balls"),
+            "status": race.get("status"),
+            "maxPlayers": race.get("maxPlayers") or 0,
+            "date": race.get("date"),
+            "venue": race.get("venue"),
+            "venueId": race.get("venueId"),
+        },
+        "participants": participants,
+        "joined": any(p["user_id"] == user_id for p in participants),
+        "isOwner": race.get("_ownerId") == user_id,
+    }
+
+
+@app.post("/api/races/{race_id}/join")
+def join_race(race_id: str, body: JoinIn, user_id: str = Depends(current_user)) -> dict:
+    race = db.get_race(race_id)
+    if not race:
+        raise HTTPException(status_code=404, detail="比赛不存在")
+    if race.get("status") != "open":
+        raise HTTPException(status_code=409, detail="当前不在报名阶段")
+    participants = db.list_participants(race_id)
+    limit = race.get("maxPlayers") or 0
+    if limit and len(participants) >= limit and not any(p["user_id"] == user_id for p in participants):
+        raise HTTPException(status_code=409, detail="报名已满")
+    db.add_participant(race_id, user_id, body.name.strip()[:20] or "球友", body.gender, body.level)
+    return {
+        "participants": db.list_participants(race_id),
+        "joined": True,
+    }
+
+
+@app.delete("/api/races/{race_id}/join")
+def leave_race(race_id: str, user_id: str = Depends(current_user)) -> dict:
+    race = db.get_race(race_id)
+    if not race:
+        raise HTTPException(status_code=404, detail="比赛不存在")
+    if race.get("status") == "playing":
+        raise HTTPException(status_code=409, detail="比赛进行中，不能退出")
+    db.remove_participant(race_id, user_id)
+    return {"participants": db.list_participants(race_id), "joined": False}
+
+
+@app.post("/api/races/{race_id}/start")
+def start_race(race_id: str, body: StartIn, user_id: str = Depends(current_user)) -> dict:
+    race = db.get_race(race_id)
+    if not race:
+        raise HTTPException(status_code=404, detail="比赛不存在")
+    if race.get("_ownerId") != user_id:
+        raise HTTPException(status_code=403, detail="只有创建者可以开始比赛")
+    if race.get("status") not in ("draft", "open"):
+        raise HTTPException(status_code=409, detail="比赛已开始")
+    if not body.players or not body.matches:
+        raise HTTPException(status_code=400, detail="缺少选手或对阵")
+    race["players"] = [p.model_dump() for p in body.players]
+    race["matches"] = [m.model_dump() for m in body.matches]
+    race["status"] = "playing"
+    return _race_for_view(db.save_race(user_id, race))
+
+
+@app.post("/api/races/{race_id}/finish")
+def finish_race(race_id: str, user_id: str = Depends(current_user)) -> dict:
+    race = db.get_race(race_id)
+    if not race:
+        raise HTTPException(status_code=404, detail="比赛不存在")
+    if race.get("_ownerId") != user_id:
+        raise HTTPException(status_code=403, detail="只有创建者可以结束比赛")
+    if race.get("status") != "playing":
+        raise HTTPException(status_code=409, detail="比赛未在进行中")
+    race["status"] = "done"
+    db.save_race(user_id, race)
+    return summary(race_id, user_id)
+
+
+@app.get("/api/races/{race_id}/participants")
+def race_participants(race_id: str, user_id: str = Depends(current_user)) -> dict:
+    race = db.get_race(race_id)
+    if not race:
+        raise HTTPException(status_code=404, detail="比赛不存在")
+    return {
+        "participants": db.list_participants(race_id),
+        "isOwner": race.get("_ownerId") == user_id,
+        "status": race.get("status"),
+        "maxPlayers": race.get("maxPlayers") or 0,
+        "joinCode": race.get("joinCode"),
+    }
+
+
+@app.get("/api/races/{race_id}/live")
+def live_race(race_id: str, since: int = 0, user_id: str = Depends(current_user)) -> dict:
+    race = db.get_race(race_id)
+    if not race:
+        raise HTTPException(status_code=404, detail="比赛不存在")
+    updated = race.get("_updatedAt") or 0
+    return {
+        "changed": updated > since,
+        "updatedAt": updated,
+        "status": race.get("status"),
+        "race": _race_for_view(race) if updated > since else None,
+    }
+
+
+@app.get("/api/races/{race_id}/summary")
+def summary(race_id: str, user_id: str = Depends(current_user)) -> dict:
+    race = db.get_race(race_id)
+    if not race:
+        raise HTTPException(status_code=404, detail="比赛不存在")
+    result = rules.compute(race)
+    return {
+        "race": {
+            "id": race["id"],
+            "name": race.get("name"),
+            "mode": race.get("mode"),
+            "rounds": race.get("rounds"),
+            "balls": race.get("balls"),
+            "status": race.get("status"),
+        },
+        "ranking": result,
+        "matches": race.get("matches") or [],
+        "finishedAt": race.get("_updatedAt") if race.get("status") == "done" else None,
+    }
+
+
+@app.get("/api/races/{race_id}")
+def get_race(race_id: str, user_id: str = Depends(current_user)) -> dict:
+    race = db.get_race(race_id)
+    if not race:
+        raise HTTPException(status_code=404, detail="比赛不存在")
+    return race
+
+
+@app.put("/api/races/{race_id}")
+def put_race(race_id: str, race: RaceIn, user_id: str = Depends(current_user)) -> dict:
+    existing = db.get_race(race_id)
+    if existing and existing.get("_ownerId") != user_id:
+        raise HTTPException(status_code=403, detail="只有创建者可以修改")
+    doc = race.model_dump()
+    doc["id"] = race_id
+    return db.save_race(user_id, doc)
+
+
+@app.delete("/api/races/{race_id}")
+def delete_race(race_id: str, user_id: str = Depends(current_user)) -> dict:
+    if not db.delete_race(race_id, user_id):
+        raise HTTPException(status_code=404, detail="比赛不存在或无权删除")
+    return {"ok": True}
+
+
+@app.put("/api/races/{race_id}/matches/{match_id}")
+def put_match(
+    race_id: str, match_id: str, match: Match, user_id: str = Depends(current_user)
+) -> dict:
+    race = db.get_race(race_id)
+    if not race:
+        raise HTTPException(status_code=404, detail="比赛不存在")
+    if race.get("_ownerId") != user_id:
+        raise HTTPException(status_code=403, detail="只有创建者可以记分")
+    matches = race.get("matches") or []
+    for i, m in enumerate(matches):
+        if m.get("id") == match_id:
+            matches[i] = match.model_dump()
+            break
+    else:
+        raise HTTPException(status_code=404, detail="对阵不存在")
+    return db.save_race(user_id, race)
+
+
+@app.get("/api/races/{race_id}/rank")
+def race_rank(race_id: str, user_id: str = Depends(current_user)) -> dict:
+    race = db.get_race(race_id)
+    if not race:
+        raise HTTPException(status_code=404, detail="比赛不存在")
+    return rules.compute(race)
+
+
+@app.get("/")
+def index() -> RedirectResponse:
+    return RedirectResponse("/h5/")
+
+
+@app.get("/api/stats")
+def stats(name: str = Query(..., min_length=1), user_id: str = Depends(current_user)) -> dict:
+    races = [db.get_race(item["id"]) for item in db.list_races(user_id)]
+    return rules.personal_stats([r for r in races if r], name)
+
+
+# ---------------------------------------------------------------- 玩法
+
+@app.get("/api/formats")
+def formats(user_id: str = Depends(current_user)) -> dict:
+    """玩法实现代码在仓库里（shared/plays），这里只下发管理员的覆写。"""
+    return {"overrides": db.list_format_overrides()}
+
+
+@app.put("/api/formats/{play_id}")
+def put_format(
+    play_id: str, body: FormatOverrideIn, user_id: str = Depends(require_admin)
+) -> dict:
+    return db.save_format_override(play_id, body.model_dump())
+
+
+@app.delete("/api/formats/{play_id}")
+def reset_format(play_id: str, user_id: str = Depends(require_admin)) -> dict:
+    db.delete_format_override(play_id)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- 微信 JS-SDK
+
+_ACCESS_TOKEN = {"value": None, "exp": 0}
+_JSAPI_TICKET = {"value": None, "exp": 0}
+
+
+def _wechat_json(url: str) -> dict:
+    with urllib.request.urlopen(url, timeout=5) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _access_token() -> str:
+    if _ACCESS_TOKEN["value"] and _ACCESS_TOKEN["exp"] > time.time():
+        return _ACCESS_TOKEN["value"]
+    data = _wechat_json(
+        "https://api.weixin.qq.com/cgi-bin/token?"
+        + urllib.parse.urlencode(
+            {"grant_type": "client_credential", "appid": WECHAT_APPID, "secret": WECHAT_SECRET}
+        )
+    )
+    token = data.get("access_token")
+    if not token:
+        raise HTTPException(status_code=502, detail=data.get("errmsg") or "获取 access_token 失败")
+    _ACCESS_TOKEN["value"] = token
+    _ACCESS_TOKEN["exp"] = time.time() + int(data.get("expires_in", 7200)) - 300
+    return token
+
+
+def _jsapi_ticket() -> str:
+    if _JSAPI_TICKET["value"] and _JSAPI_TICKET["exp"] > time.time():
+        return _JSAPI_TICKET["value"]
+    data = _wechat_json(
+        "https://api.weixin.qq.com/cgi-bin/ticket/getticket?"
+        + urllib.parse.urlencode({"access_token": _access_token(), "type": "jsapi"})
+    )
+    ticket = data.get("ticket")
+    if not ticket:
+        raise HTTPException(status_code=502, detail=data.get("errmsg") or "获取 jsapi_ticket 失败")
+    _JSAPI_TICKET["value"] = ticket
+    _JSAPI_TICKET["exp"] = time.time() + int(data.get("expires_in", 7200)) - 300
+    return ticket
+
+
+@app.get("/api/wechat/jssdk")
+def wechat_jssdk(url: str) -> dict:
+    """微信 JS-SDK 签名，用于 wx.openLocation 调起内置地图。"""
+    if not (WECHAT_APPID and WECHAT_SECRET):
+        raise HTTPException(status_code=501, detail="服务端未配置公众号，无法使用微信内置地图")
+    ticket = _jsapi_ticket()
+    nonce = secrets.token_hex(8)
+    stamp = int(time.time())
+    plain = "jsapi_ticket=%s&noncestr=%s&timestamp=%s&url=%s" % (
+        ticket,
+        nonce,
+        stamp,
+        url.split("#")[0],
+    )
+    return {
+        "appId": WECHAT_APPID,
+        "timestamp": stamp,
+        "nonceStr": nonce,
+        "signature": hashlib.sha1(plain.encode("utf-8")).hexdigest(),
+    }
+
+
+# ---------------------------------------------------------------- 静态资源
+
+ROOT = Path(__file__).resolve().parents[2]
+app.mount("/h5", StaticFiles(directory=ROOT / "h5", html=True), name="h5")
+app.mount("/shared", StaticFiles(directory=ROOT / "shared"), name="shared")
