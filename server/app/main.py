@@ -430,6 +430,8 @@ def list_races(full: bool = False, user_id: str = Depends(current_user)) -> dict
                         "maxPlayers": r.get("maxPlayers") or 0,
                         "mine": r.get("_ownerId") == user_id,
                         "ownerId": r.get("_ownerId"),
+                        "ownerName": (db.get_user(r.get("_ownerId") or "") or {}).get("nickname")
+                        or (r.get("_ownerId") or "")[:10],
                     }
                 )
     if not full:

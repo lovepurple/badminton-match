@@ -365,6 +365,10 @@ if (!state.avatar) state.avatar = "";
     return updated;
   }
 
+  async function adminFinish(raceId) {
+    return call('/api/admin/races/' + raceId + '/finish', { method: 'POST' });
+  }
+
   async function people() {
     return call('/api/people');
   }
@@ -411,6 +415,7 @@ if (!state.avatar) state.avatar = "";
     setMe,
     avatar,
     updateProfile,
+    adminFinish,
     people
   };
 })(window);

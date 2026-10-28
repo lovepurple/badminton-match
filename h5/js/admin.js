@@ -94,6 +94,11 @@
     );
   }
 
+  function playOf(id) {
+    const found = PLAYS.find((p) => p.id === id);
+    return found || { id, name: id, group: "doubles", min: 2, max: 50, intro: "", rules: {}, defaults: {} };
+  }
+
   async function loadPlays() {
     let overrides = {};
     try {
@@ -141,6 +146,7 @@
   function tabBar() {
     return (
       '<div class="admin-tabs">' +
+      '<button data-atab="races" class="' + (tab === "races" ? "on" : "") + '">全部比赛</button>' +
       '<button data-atab="people" class="' + (tab === "people" ? "on" : "") + '">人员统计</button>' +
       '<button data-atab="formats" class="' + (tab === "formats" ? "on" : "") + '">玩法管理</button>' +
       '<button data-atab="venues" class="' + (tab === "venues" ? "on" : "") + '">场馆管理</button>' +
@@ -300,6 +306,119 @@
         renderFormats();
       };
     }
+  }
+
+  /* ---------------- 全部比赛（管理员） ---------------- */
+
+  const STATUS_TEXT = { draft: "未开放", open: "报名中", playing: "进行中", done: "已结束" };
+
+  async function renderRaces() {
+    topbar.innerHTML = topbarHTML({ title: "全部比赛" });
+    wireTop();
+
+    let filter = "all";
+    const wants = new URLSearchParams(location.search).get("f") || "all";
+
+    await S.pull(); // 管理员：全量列表
+    const all = S.races().slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+    const build = () => {
+      const filtered = all.filter(
+        (r) => wants === "all" || r.status === wants
+      );
+      let html =
+        tabBar() +
+        '<div class="admin-tabs" style="margin-top:10px">' +
+        [["all", "全部"], ["playing", "进行中"], ["open", "报名中"], ["done", "已结束"]]
+          .map(
+            ([k, label]) =>
+              '<button data-f="' + k + '" class="' + (wants === k ? "on" : "") + '">' + label + "</button>"
+          )
+          .join("") +
+        "</div>" +
+        '<div class="hint" style="margin-bottom:12px">管理员可见全部比赛：点击查看实时详情，进行中的可强制结束。</div>';
+
+      if (!filtered.length) {
+        html += '<div class="empty">没有比赛</div>';
+        view.innerHTML = html;
+        wireTabs();
+        return;
+      }
+
+      html +=
+        '<div class="admin-grid">' +
+        filtered
+          .map((r) => {
+            const done = r.matches.filter((m) => m.status === "done").length;
+            return (
+              '<div class="card race-admin-card">' +
+              '<h3>' + esc(r.name) + ' <span class="badge">' + esc(STATUS_TEXT[r.status] || r.status) + "</span></h3>" +
+              '<div class="meta">' + esc(playOf(r.mode).name) + " · " + esc(R.roundsName(r.rounds)) + " · " + esc(R.ballsName(r.balls)) + "</div>" +
+              '<div class="meta">' +
+              (r.date ? "时间 " + esc(String(r.date).replace("T", " ").slice(0, 16)) : "未定时间") +
+              (r.venueName ? " · " + esc(r.venueName) : "") +
+              "</div>" +
+              '<div class="meta">创建者 ' + esc(r.ownerName || "") + " · " + (r.players || 0) + " 人 · 已完成 " + done + "/" + (r.matches || 0) + " 场</div>" +
+              '<div class="tabs" style="margin-top:10px">' +
+              '<button data-open="' + esc(r.id) + '">查看详情</button>' +
+              (r.status === "playing"
+                ? '<button data-finish="' + esc(r.id) + '">强制结束</button>'
+                : "") +
+              "</div></div>"
+            );
+          })
+          .join("") +
+        "</div>";
+      view.innerHTML = html;
+      wireTabs();
+      wireRaces();
+    };
+    build();
+  }
+
+  function wireTabs() {
+    view.querySelectorAll("[data-atab]").forEach((btn) => {
+      btn.onclick = () => {
+        tab = btn.dataset.atab;
+        render();
+      };
+    });
+  }
+
+  function wireRaces() {
+    view.querySelectorAll("[data-f]").forEach((btn) => {
+      btn.onclick = () => {
+        location.search = "f=" + btn.dataset.f;
+        renderRaces();
+      };
+    });
+    view.querySelectorAll("[data-open]").forEach((btn) => {
+      btn.onclick = () => {
+        const device = new URLSearchParams(location.search).get("device");
+        location.href =
+          "index.html" +
+          (device ? "?device=" + encodeURIComponent(device) : "") +
+          "#/race/" + btn.dataset.open;
+      };
+    });
+    view.querySelectorAll("[data-finish]").forEach((btn) => {
+      btn.onclick = () =>
+        modal("强制结束这场比赛？将汇总当前比分。", [
+          { label: "取消" },
+          {
+            label: "强制结束",
+            primary: true,
+            fn: async () => {
+              try {
+                await S.adminFinish(btn.dataset.finish);
+                renderRaces();
+              } catch (e) {
+                modal((e && e.detail) || "操作失败");
+              }
+            }
+          }
+        ]);
+    });
   }
 
   /* ---------------- 人员统计 ---------------- */
@@ -517,7 +636,8 @@
 
   async function render() {
     const want = location.hash.replace("#", "");
-    if (["people", "venues", "formats"].indexOf(want) >= 0) tab = want;
+    if (["races", "people", "venues", "formats"].indexOf(want) >= 0) tab = want;
+    if (tab === "races") return renderRaces();
     if (tab === "people") return renderPeople();
     if (tab === "venues") return renderVenues();
     return renderFormats();
