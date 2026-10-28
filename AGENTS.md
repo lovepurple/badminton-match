@@ -49,6 +49,21 @@ server/             FastAPI
 10. **坐标是 gcj02**（高德/腾讯）；不要按 WGS84 处理，否则国内会偏移。
 11. **导航顺序**：微信内 JS-SDK `wx.openLocation` → 高德 URI → 复制地址。不要直接跳 Google Maps。
 
+## 3.5 权限模型
+
+```
+管理员(role=admin) > 创建者(race._ownerId) > 成员(participants/对阵选手) > 访客(其他登录用户)
+```
+
+- 管理员：可见全部比赛与实时比分、可强制结束/删除任意比赛、可管理成员角色（`/api/users`）。
+- 创建者：本场比赛全权（开放报名/开始/记分/结束/改配置/删除）。
+- 成员：看自己报名比赛的对阵、实时比分、汇总。
+- 访客：仅能看到时间、场馆、玩法规则（`_viewer: "guest"`，`matches/players/teams/joinCode` 已裁剪）；
+  `live` / `summary` 返回 403。
+
+实现集中在这几处：`race_access()` / `can_view_scores()` / `_to_view()`（`server/app/main.py`）。
+改权限时三处一起改，并补 `server/tests/test_permissions.py`。
+
 ## 4. 状态机
 
 ```

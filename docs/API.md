@@ -104,7 +104,7 @@ Base：`http://<host>:18000`（端口可改）。除 `POST /api/auth/login` 与 
 | GET | `/api/races/{id}/participants` | 报名名单 + `isOwner` + `status` + `joinCode` |
 | POST | `/api/races/{id}/start` | 开始比赛，body `{"players":[...],"matches":[...]}`（对阵由客户端生成） |
 | POST | `/api/races/{id}/finish` | 结束比赛，返回汇总 |
-| GET | `/api/races/{id}/live?since=<updatedAt>` | 实时轮询；无变化时 `changed=false` 且不返回 `race` |
+| GET | `/api/races/{id}/live?since=<updatedAt>` | 实时轮询（创建者/成员/管理员）；访客 403 |
 | GET | `/api/races/{id}/summary` | 汇总：最终排名 + 全部对阵 |
 
 `GET /api/races` 返回「自己创建的 + 自己报名过的」比赛，摘要里带 `status`、`joinCode`、`maxPlayers`、`mine`。

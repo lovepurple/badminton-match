@@ -106,6 +106,36 @@ test('混双转：每对男女各搭档一次', () => {
   Object.keys(seen).forEach((key) => assert.strictEqual(seen[key], 1, key));
 });
 
+console.log('场地数');
+test('八人转 courts=1：14 场顺延成 14 轮，每轮 1 场', () => {
+  const ps = players(8);
+  const ms = plays.generate({ mode: 'eight', players: ps, courts: 1 });
+  assert.strictEqual(ms.length, 14);
+  const rounds = new Set(ms.map((m) => m.round));
+  assert.strictEqual(rounds.size, 14);
+  ms.forEach((m) => assert.strictEqual(m.court, 1));
+});
+test('courts=2：每轮 2 场，7 轮', () => {
+  const ps = players(8);
+  const ms = plays.generate({ mode: 'eight', players: ps, courts: 2 });
+  const perRound = {};
+  ms.forEach((m) => {
+    perRound[m.round] = (perRound[m.round] || 0) + 1;
+  });
+  Object.values(perRound).forEach((n) => assert.ok(n <= 2, '每轮超过 2 场: ' + n));
+  assert.strictEqual(new Set(ms.map((m) => m.round)).size, 7);
+});
+test('自动（0）不压场地', () => {
+  const ps = players(8);
+  const ms = plays.generate({ mode: 'eight', players: ps });
+  assert.strictEqual(new Set(ms.map((m) => m.round)).size, 7);
+});
+test('追分类玩法不因 courts 压轮（保持每场一局）', () => {
+  const ps = players(8);
+  const ms = plays.generate({ mode: 'chase', players: ps, courts: 1 });
+  assert.strictEqual(ms.length, 12);
+});
+
 console.log('排名主体');
 test('个人玩法按人、团体玩法按队', () => {
   assert.strictEqual(plays.entityKind('eight'), 'player');

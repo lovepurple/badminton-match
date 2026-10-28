@@ -155,6 +155,7 @@ class RaceIn(BaseModel):
     groupSize: int = 4
     groupsValid: int = 3
     date: str | None = None
+    courts: int = 0
     playName: str | None = None
     playRules: dict | None = None
     venueId: str | None = None
@@ -166,6 +167,11 @@ class RaceIn(BaseModel):
 
 
 # ---------------------------------------------------------------- 鉴权
+
+def _is_admin(user_id: str) -> bool:
+    user = db.get_user(user_id)
+    return bool(user and user.get("role") == "admin")
+
 
 def current_user(authorization: str | None = Header(default=None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
@@ -181,6 +187,39 @@ def require_admin(user_id: str = Depends(current_user)) -> str:
     if not user or user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="需要管理员权限")
     return user_id
+
+
+def _participant_ids(race: dict) -> set:
+    """已报名（或已是比赛选手）的用户 id 集合。"""
+    return set()
+
+
+def race_access(race: dict | None, user_id: str) -> tuple[str, bool]:
+    """返回 (role, can_view_race)。
+
+    role ∈ creator | participant | guest | none
+    - creator：race._ownerId == user_id（或管理员）
+    - participant：报过名（participants 表）或在对阵选手里
+    - guest：其他登录用户（能看比赛信息，但看不到比分/对阵）
+    - none：比赛不存在/已删除
+    """
+    if not race:
+        return ("none", False)
+    if user_id == race.get("_ownerId"):
+        return ("creator", True)
+    parts = db.list_participants(race["id"])
+    if any(p["user_id"] == user_id for p in parts):
+        return ("participant", True)
+    for m in race.get("matches") or []:
+        if user_id in (m.get("side1") or []) or user_id in (m.get("side2") or []):
+            return ("participant", True)
+    return ("guest", False)
+
+
+def can_view_scores(race: dict | None, user_id: str) -> bool:
+    """是否能看到对阵/比分：creator 或 participant。"""
+    role, _ = race_access(race, user_id)
+    return role in ("creator", "participant")
 
 
 def _assign_role(user_id: str, device_id: str | None) -> None:
@@ -369,6 +408,30 @@ def remove_venue(venue_id: str, user_id: str = Depends(require_admin)) -> dict:
 @app.get("/api/races")
 def list_races(full: bool = False, user_id: str = Depends(current_user)) -> dict:
     summaries = db.list_races(user_id)
+    if (_is_admin(user_id)):
+        # 管理员：全量（自己 + 别人）
+        all_races = db.list_races_all()
+        mine = {r["id"] for r in summaries}
+        for r in all_races:
+            if r["id"] not in mine:
+                summaries.append(
+                    {
+                        "id": r["id"],
+                        "name": r.get("name") or "未命名比赛",
+                        "mode": r.get("mode") or "",
+                        "group": r.get("group") or "",
+                        "rounds": r.get("rounds"),
+                        "balls": r.get("balls"),
+                        "players": len(r.get("players") or []),
+                        "matches": len(r.get("matches") or []),
+                        "updatedAt": r.get("_updatedAt"),
+                        "status": r.get("status"),
+                        "joinCode": r.get("joinCode"),
+                        "maxPlayers": r.get("maxPlayers") or 0,
+                        "mine": r.get("_ownerId") == user_id,
+                        "ownerId": r.get("_ownerId"),
+                    }
+                )
     if not full:
         return {"races": summaries}
     return {"races": [db.get_race(item["id"]) for item in summaries]}
@@ -528,12 +591,14 @@ def live_race(race_id: str, since: int = 0, user_id: str = Depends(current_user)
     race = db.get_race(race_id)
     if not race:
         raise HTTPException(status_code=404, detail="比赛不存在")
+    if not can_view_scores(race, user_id) and not _is_admin(user_id):
+        raise HTTPException(status_code=403, detail="报名后才能查看实时比分")
     updated = race.get("_updatedAt") or 0
     return {
         "changed": updated > since,
         "updatedAt": updated,
         "status": race.get("status"),
-        "race": _race_for_view(race) if updated > since else None,
+        "race": _to_view(race, user_id) if updated > since else None,
     }
 
 
@@ -542,6 +607,8 @@ def summary(race_id: str, user_id: str = Depends(current_user)) -> dict:
     race = db.get_race(race_id)
     if not race:
         raise HTTPException(status_code=404, detail="比赛不存在")
+    if not can_view_scores(race, user_id) and not _is_admin(user_id):
+        raise HTTPException(status_code=403, detail="报名后才能查看汇总")
     result = rules.compute(race)
     return {
         "race": {
@@ -558,12 +625,33 @@ def summary(race_id: str, user_id: str = Depends(current_user)) -> dict:
     }
 
 
+def _to_view(race: dict, user_id: str) -> dict:
+    """对外视图：去掉内部字段；非创建者/管理员不暴露 _ownerId；访客隐藏对阵与比分。"""
+    doc = _race_for_view(race)  # 去掉 _ownerId / _updatedAt
+    if _is_admin(user_id) or can_view_scores(race, user_id):
+        if user_id == race.get("_ownerId") or _is_admin(user_id):
+            doc["_mine"] = True
+        if _is_admin(user_id):
+            doc["_ownerName"] = ""
+            owner = db.get_user(race.get("_ownerId") or "")
+            if owner:
+                doc["_ownerName"] = owner.get("nickname") or ""
+        return doc
+    # 访客：能看时间/场馆/玩法规则（宣传信息），隐藏对阵/比分/名单/报名码
+    doc["_viewer"] = "guest"
+    doc["matches"] = []
+    doc["players"] = []
+    doc["teams"] = []
+    doc.pop("joinCode", None)
+    return doc
+
+
 @app.get("/api/races/{race_id}")
 def get_race(race_id: str, user_id: str = Depends(current_user)) -> dict:
     race = db.get_race(race_id)
     if not race:
         raise HTTPException(status_code=404, detail="比赛不存在")
-    return race
+    return _to_view(race, user_id)
 
 
 @app.put("/api/races/{race_id}")
@@ -619,6 +707,51 @@ def index() -> RedirectResponse:
 def stats(name: str = Query(..., min_length=1), user_id: str = Depends(current_user)) -> dict:
     races = [db.get_race(item["id"]) for item in db.list_races(user_id)]
     return rules.personal_stats([r for r in races if r], name)
+
+
+class UserRoleIn(BaseModel):
+    role: str  # admin | user
+
+
+@app.get("/api/users")
+def list_users(user_id: str = Depends(require_admin)) -> dict:
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT id, nickname, role, created_at FROM users ORDER BY created_at"
+        ).fetchall()
+    users = []
+    for r in rows:
+        parts = db.list_participants("") if False else []
+        users.append(
+            {
+                "id": r["id"],
+                "nickname": r["nickname"] or "",
+                "role": r["role"],
+                "createdAt": r["created_at"],
+            }
+        )
+    return {"users": users}
+
+
+@app.put("/api/users/{target_id}/role")
+def set_user_role(
+    target_id: str, body: UserRoleIn, user_id: str = Depends(require_admin)
+) -> dict:
+    if body.role not in ("admin", "user"):
+        raise HTTPException(status_code=400, detail="角色只能是 admin/user")
+    db.set_role(target_id, body.role)
+    return {"id": target_id, "role": body.role}
+
+
+# 管理员可强制结束任意比赛
+@app.post("/api/admin/races/{race_id}/finish")
+def admin_finish_race(race_id: str, user_id: str = Depends(require_admin)) -> dict:
+    race = db.get_race(race_id)
+    if not race:
+        raise HTTPException(status_code=404, detail="比赛不存在")
+    race["status"] = "done"
+    db.save_race(race.get("_ownerId") or user_id, race)
+    return summary(race_id, user_id)
 
 
 @app.get("/api/people")

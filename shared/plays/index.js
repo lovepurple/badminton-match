@@ -61,10 +61,41 @@
     return modules[id] || fallbackEntry(id) || null;
   }
 
+  /*
+   * 场地数封顶：默认对位已按轮次排好；当玩法需要把每轮并行场次压到
+   * 指定场地数以内时，把多出的场次顺延到后续轮次（追分等连续计分的玩法跳过，
+   * 因为轮次是比分续航的单位）。
+   */
+  function applyCourts(matches, courts) {
+    if (!courts || courts < 1) return matches;
+    const byRound = [];
+    matches.forEach((m) => {
+      const idx = (m.round || 1) - 1;
+      (byRound[idx] = byRound[idx] || []).push(m);
+    });
+    const maxPerRound = Math.max(0, ...byRound.map((g) => (g ? g.length : 0)));
+    if (courts >= maxPerRound) return matches; // 现有轮次本来就装得下
+
+    const out = [];
+    let placed = 0;
+    matches.forEach((m) => {
+      const round = Math.floor(placed / courts) + 1;
+      out.push(Object.assign({}, m, { round, court: (placed % courts) + 1 }));
+      placed++;
+    });
+    return out;
+  }
+
+  function isChaseRace(race, play) {
+    if (play && play.scoring && play.scoring.mode === "chase") return true;
+    return race.wheelMode === "chase";
+  }
+
   function generate(race) {
     const play = modules[race.mode];
-    if (play) return play.schedule(race, fmt);
-    return fmt.generate(race);
+    const matches = play ? play.schedule(race, fmt) : fmt.generate(race);
+    if (!isChaseRace(race, play)) return applyCourts(matches, race.courts);
+    return matches;
   }
 
   function entityKind(mode) {

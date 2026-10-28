@@ -411,6 +411,7 @@
       esc(R.ballsName(race.balls)) + (isChase(race) ? " · 连续追分" : "") + "</div>" +
       '<div class="meta" style="margin-top:4px">排名：' + esc(R.rankName(race.rankMode)) + " · " +
       (BA.plays.entityKind(race.mode) === "team" ? "按队伍" : "按个人") + "</div>" +
+      (race.courts && race.courts > 1 ? '<div class="meta" style="margin-top:6px">场地：' + race.courts + " 块并行</div>" : "") +
       (race.date ? '<div class="meta" style="margin-top:6px">时间：' + esc(formatDate(race.date)) + "</div>" : "") +
       (race.venue && race.venue.name
         ? '<div class="meta">场馆：' + venueLine(race.venue) +
@@ -782,11 +783,12 @@
       const win1 = m.scoreAll && m.scoreAll[0] > m.scoreAll[1];
       const win2 = m.scoreAll && m.scoreAll[1] > m.scoreAll[0];
       const sets = (m.scores || []).map(s => s[0] + '-' + s[1]).join(' ');
+      const sub = [race.courts && race.courts > 1 ? m.court + "号场" : "", sets].filter(Boolean).join(" · ");
       out +=
         '<div class="match" data-match="' + esc(m.id) + '">' +
         '<div class="side' + (win1 ? ' win' : '') + '">' + esc(sideName(race, m.side1)) + '</div>' +
         '<div class="score">' + (m.scoreAll ? m.scoreAll[0] + ':' + m.scoreAll[1] : '未开始') +
-        (sets ? '<span class="sub">' + esc(sets) + '</span>' : '') + '</div>' +
+        (sub ? '<span class="sub">' + esc(sub) + '</span>' : '') + '</div>' +
         '<div class="side right' + (win2 ? ' win' : '') + '">' + esc(sideName(race, m.side2)) + '</div>' +
         '</div>';
     });
@@ -1043,6 +1045,7 @@
       name: '周末羽球',
       date: '',
       venueId: '',
+      courts: 0,
       signup: true,
       group: 'doubles',
       mode: 'eight',
@@ -1096,6 +1099,10 @@
       '</select>' +
       (myRole === "admin" ? '<div class="hint">没有合适的场馆？<a href="admin.html">去后台维护</a></div>' : "") +
       '</div>' +
+      '<div class="field"><label>场地数</label><div class="segmented">' +
+      '<button data-court="0" class="' + (draft.courts === 0 ? "on" : "") + '">自动</button>' +
+      [1, 2, 3, 4, 5, 6].map((n) => '<button data-court="' + n + '" class="' + (draft.courts === n ? "on" : "") + '">' + n + "</button>").join("") +
+      '</div><div class="hint">选 1 = 一场一场打；选 2 = 每次两场并行。自动按人数算出够用场地。</div></div>' +
       '<div class="field"><label>报名方式</label><div class="segmented">' +
       '<button data-signup="1" class="' + (draft.signup ? "on" : "") + '">报名制（生成链接）</button>' +
       '<button data-signup="0" class="' + (!draft.signup ? "on" : "") + '">直接开打</button>' +
@@ -1242,6 +1249,14 @@
     view.querySelector('#race-name').oninput = e => {
       draft.name = e.target.value;
     };
+    view.querySelectorAll("[data-court]").forEach(btn => {
+      btn.onclick = () => {
+        const next = Number(btn.dataset.court);
+        if (draft.courts === next) return;
+        draft.courts = next;
+        renderCreate();
+      };
+    });
     view.querySelectorAll("[data-signup]").forEach(btn => {
       btn.onclick = () => {
         const next = btn.dataset.signup === "1";
@@ -1409,6 +1424,7 @@
       name: draft.name || '未命名比赛',
       playName: play.name,
       playRules: play.rules || {},
+      courts: draft.courts || 0,
       date: draft.date || null,
       venueId: venue ? venue.id : null,
       venue: venue
