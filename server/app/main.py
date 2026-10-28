@@ -123,6 +123,15 @@ class ResolveIn(BaseModel):
     url: str
 
 
+class PresetIn(BaseModel):
+    name: str
+    data: dict
+
+
+class PresetIdIn(BaseModel):
+    id: str
+
+
 class OpenIn(BaseModel):
     maxPlayers: int = 0
 
@@ -506,32 +515,6 @@ def join_info(code: str, user_id: str = Depends(current_user)) -> dict:
     }
 
 
-@app.post("/api/races/{race_id}/join")
-def join_race(race_id: str, body: JoinIn, user_id: str = Depends(current_user)) -> dict:
-    race = db.get_race(race_id)
-    if not race:
-        raise HTTPException(status_code=404, detail="比赛不存在")
-    if race.get("status") != "open":
-        raise HTTPException(status_code=409, detail="当前不在报名阶段")
-    participants = db.list_participants(race_id)
-    limit = race.get("maxPlayers") or 0
-    if limit and len(participants) >= limit and not any(p["user_id"] == user_id for p in participants):
-        raise HTTPException(status_code=409, detail="报名已满")
-    avatar = body.avatar if body.avatar and len(body.avatar) < 300 * 1024 else None
-    db.add_participant(
-        race_id,
-        user_id,
-        body.name.strip()[:20] or "球友",
-        avatar,
-        body.gender,
-        body.level,
-    )
-    return {
-        "participants": db.list_participants(race_id),
-        "joined": True,
-    }
-
-
 @app.delete("/api/races/{race_id}/join")
 def leave_race(race_id: str, user_id: str = Depends(current_user)) -> dict:
     race = db.get_race(race_id)
@@ -539,8 +522,12 @@ def leave_race(race_id: str, user_id: str = Depends(current_user)) -> dict:
         raise HTTPException(status_code=404, detail="比赛不存在")
     if race.get("status") == "playing":
         raise HTTPException(status_code=409, detail="比赛进行中，不能退出")
+    before = {p["user_id"]: p for p in db.list_participants(race_id)}
     db.remove_participant(race_id, user_id)
-    return {"participants": db.list_participants(race_id), "joined": False}
+    promoted = None
+    if before.get(user_id) and not before[user_id]["waitlisted"]:
+        promoted = db.promote_waitlist(race_id)
+    return {"participants": db.list_participants(race_id), "joined": False, "promoted": promoted}
 
 
 @app.post("/api/races/{race_id}/start")
@@ -743,6 +730,117 @@ def set_user_role(
         raise HTTPException(status_code=400, detail="角色只能是 admin/user")
     db.set_role(target_id, body.role)
     return {"id": target_id, "role": body.role}
+
+
+@app.post("/api/races/{race_id}/cancel")
+def cancel_race(race_id: str, user_id: str = Depends(current_user)) -> dict:
+    """创建者（或管理员）取消比赛：状态置 cancel，报名保留。"""
+    race = db.get_race(race_id)
+    if not race:
+        raise HTTPException(status_code=404, detail="比赛不存在")
+    if race.get("_ownerId") != user_id and not _is_admin(user_id):
+        raise HTTPException(status_code=403, detail="只有创建者可以取消比赛")
+    if race.get("status") in ("playing", "done"):
+        raise HTTPException(status_code=409, detail="比赛已开始或已结束，不能取消")
+    race["status"] = "cancel"
+    db.save_race(race.get("_ownerId") or user_id, race)
+    return {"ok": True, "status": "cancel"}
+
+
+# 候补
+@app.post("/api/races/{race_id}/waitlist")
+def join_waitlist(race_id: str, body: JoinIn, user_id: str = Depends(current_user)) -> dict:
+    """满员时进入候补队列。"""
+    race = db.get_race(race_id)
+    if not race:
+        raise HTTPException(status_code=404, detail="比赛不存在")
+    if race.get("status") != "open":
+        raise HTTPException(status_code=409, detail="当前不在报名阶段")
+    participants = db.list_participants(race_id)
+    limit = race.get("maxPlayers") or 0
+    already = next((p for p in participants if p["user_id"] == user_id), None)
+    if limit and len([p for p in participants if not p["waitlisted"]]) < limit:
+        if already:
+            return {"participants": db.list_participants(race_id), "waitlisted": False}
+    if already:
+        db.set_waitlisted(race_id, user_id, True)
+        return {"participants": db.list_participants(race_id), "waitlisted": True}
+    avatar = body.avatar if body.avatar and len(body.avatar) < 300 * 1024 else None
+    db.add_participant(
+        race_id, user_id, body.name.strip()[:20] or "球友", avatar, body.gender, body.level
+    )
+    db.set_waitlisted(race_id, user_id, True)
+    return {"participants": db.list_participants(race_id), "waitlisted": True}
+
+
+@app.delete("/api/races/{race_id}/participants/{target_id}")
+def kick_participant(
+    race_id: str, target_id: str, user_id: str = Depends(current_user)
+) -> dict:
+    """创建者移出名额（正式或候补）；若移除正式成员且存在候补，自动递补第一个候补。"""
+    race = db.get_race(race_id)
+    if not race:
+        raise HTTPException(status_code=404, detail="比赛不存在")
+    if race.get("_ownerId") != user_id and not _is_admin(user_id):
+        raise HTTPException(status_code=403, detail="只有创建者可以移除成员")
+    targets = [p for p in db.list_participants(race_id) if p["user_id"] == target_id]
+    if not targets:
+        raise HTTPException(status_code=404, detail="成员不存在")
+    removed_was = targets[0]
+    db.remove_participant(race_id, target_id)
+    promoted = None
+    if not removed_was["waitlisted"]:
+        promoted = db.promote_waitlist(race_id)
+    return {
+        "participants": db.list_participants(race_id),
+        "promoted": promoted,
+    }
+
+
+# 让报名直接复用加入逻辑但区分候补：改造 join
+def _join_impl(race_id, body, user_id):
+    race = db.get_race(race_id)
+    if not race or race.get("status") != "open":
+        raise HTTPException(status_code=409, detail="当前不在报名阶段")
+    participants = db.list_participants(race_id)
+    limit = race.get("maxPlayers") or 0
+    already = next((p for p in participants if p["user_id"] == user_id), None)
+    full = limit and len([p for p in participants if not p["waitlisted"]]) >= limit
+    if full and not already:
+        raise HTTPException(status_code=409, detail="报名已满，请进入候补队列")
+    avatar = body.avatar if body.avatar and len(body.avatar) < 300 * 1024 else None
+    if already:
+        if already["waitlisted"] and not full:
+            db.set_waitlisted(race_id, user_id, False)
+        db.add_participant(race_id, user_id, body.name.strip()[:20] or "球友", avatar, body.gender, body.level)
+    else:
+        db.add_participant(race_id, user_id, body.name.strip()[:20] or "球友", avatar, body.gender, body.level)
+    return db.list_participants(race_id)
+
+
+@app.post("/api/races/{race_id}/join")
+def join_race(race_id: str, body: JoinIn, user_id: str = Depends(current_user)) -> dict:
+    participants = _join_impl(race_id, body, user_id)
+    return {"participants": participants, "joined": True}
+
+
+# 常用模板
+@app.get("/api/presets")
+def presets(user_id: str = Depends(current_user)) -> dict:
+    return {"presets": db.list_presets(user_id)}
+
+
+@app.post("/api/presets")
+def create_preset(body: PresetIn, user_id: str = Depends(current_user)) -> dict:
+    preset = db.save_preset("p_" + uuid.uuid4().hex[:10], user_id, body.name.strip()[:20] or "模板", body.data)
+    return preset
+
+
+@app.delete("/api/presets/{preset_id}")
+def remove_preset(preset_id: str, user_id: str = Depends(current_user)) -> dict:
+    if not db.delete_preset(preset_id, user_id):
+        raise HTTPException(status_code=404, detail="模板不存在或无权删除")
+    return {"ok": True}
 
 
 # 管理员可强制结束任意比赛

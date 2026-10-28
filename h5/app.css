@@ -675,3 +675,8 @@ details.card[open] summary {
   line-height: 44px;
   font-size: 20px;
 }
+
+.segmented button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}

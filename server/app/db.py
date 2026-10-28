@@ -81,6 +81,15 @@ CREATE TABLE IF NOT EXISTS format_overrides (
     updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS presets (
+    id         TEXT PRIMARY KEY,
+    owner_id   TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    data       TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS participants (
     race_id   TEXT NOT NULL,
     user_id   TEXT NOT NULL,
@@ -89,6 +98,7 @@ CREATE TABLE IF NOT EXISTS participants (
     gender    TEXT NOT NULL DEFAULT 'M',
     level     INTEGER NOT NULL DEFAULT 0,
     joined_at INTEGER NOT NULL,
+    waitlisted INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (race_id, user_id)
 );
 """
@@ -101,6 +111,7 @@ COLUMNS = [
     ("users", "role", "TEXT NOT NULL DEFAULT 'user'"),
     ("users", "avatar", "TEXT"),
     ("participants", "avatar", "TEXT"),
+    ("participants", "waitlisted", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -353,11 +364,72 @@ def remove_participant(race_id: str, user_id: str) -> None:
 def list_participants(race_id: str) -> list[dict]:
     with connect() as conn:
         rows = conn.execute(
-            "SELECT user_id, name, avatar, gender, level, joined_at FROM participants"
+            "SELECT user_id, name, avatar, gender, level, joined_at, waitlisted FROM participants"
             " WHERE race_id=? ORDER BY joined_at",
             (race_id,),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def set_waitlisted(race_id: str, user_id: str, flag: bool) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE participants SET waitlisted=? WHERE race_id=? AND user_id=?",
+            (1 if flag else 0, race_id, user_id),
+        )
+
+
+def promote_waitlist(race_id: str) -> str | None:
+    """把候补里最早报名的提升为正式成员，返回其 user_id（无候补返回 None）。"""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT user_id FROM participants WHERE race_id=? AND waitlisted=1"
+            " ORDER BY joined_at LIMIT 1",
+            (race_id,),
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE participants SET waitlisted=0 WHERE race_id=? AND user_id=?",
+                (race_id, row["user_id"]),
+            )
+    return row["user_id"] if row else None
+
+
+# ---- 常用模板 -----------------------------------------------------------
+
+def list_presets(owner_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM presets WHERE owner_id=? ORDER BY updated_at DESC", (owner_id,)
+        ).fetchall()
+    out = []
+    for r in rows:
+        doc = json.loads(r["data"])
+        doc["id"] = r["id"]
+        doc["name"] = r["name"]
+        out.append(doc)
+    return out
+
+
+def save_preset(preset_id: str, owner_id: str, name: str, data: dict) -> dict:
+    stamp = now()
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO presets(id, owner_id, name, data, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?)"
+            " ON CONFLICT(id) DO UPDATE SET name=excluded.name, data=excluded.data,"
+            " updated_at=excluded.updated_at",
+            (preset_id, owner_id, name, json.dumps(data, ensure_ascii=False), stamp, stamp),
+        )
+    data["id"] = preset_id
+    data["name"] = name
+    return data
+
+
+def delete_preset(preset_id: str, owner_id: str) -> bool:
+    with connect() as conn:
+        cur = conn.execute("DELETE FROM presets WHERE id=? AND owner_id=?", (preset_id, owner_id))
+    return cur.rowcount > 0
 
 
 def list_races_all() -> list[dict]:

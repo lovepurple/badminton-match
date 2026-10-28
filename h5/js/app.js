@@ -16,6 +16,7 @@
   let myRole = "user";
   let PLAYS = [];
   let PLAY_MAP = {};
+  let PRESETS = [];
   let VENUE_CACHE = null;
 
   /* ---------------- 基础 ---------------- */
@@ -102,6 +103,33 @@
       });
     }
     return base;
+  }
+
+  function pushUndo(match, snapshot) {
+    match.history = match.history || [];
+    match.history.push(snapshot);
+    if (match.history.length > 60) match.history.shift();
+  }
+
+  function undoScore(race, match) {
+    const history = match.history || [];
+    if (!history.length) return false;
+    const prev = history.pop();
+    match.crt = prev.crt.slice();
+    match.scores = prev.scores.map((s) => s.slice());
+    match.scoreAll = prev.scoreAll ? prev.scoreAll.slice() : null;
+    match.status = prev.status;
+    S.cache(race);
+    return true;
+  }
+
+  function snapshotOf(match) {
+    return {
+      crt: match.crt.slice(),
+      scores: (match.scores || []).map((s) => s.slice()),
+      scoreAll: match.scoreAll ? match.scoreAll.slice() : null,
+      status: match.status
+    };
   }
 
   function countAll(sets) {
@@ -371,7 +399,7 @@
     modal(text, [{ label: "长按上面的链接可复制", primary: true }]);
   }
 
-  const STATUS_TEXT = { draft: "未开放", open: "报名中", playing: "进行中", done: "已结束" };
+  const STATUS_TEXT = { draft: "未开放", open: "报名中", playing: "进行中", done: "已结束", cancel: "已取消" };
 
   async function renderRace(race, tab) {
     stopPolling();
@@ -436,20 +464,40 @@
     if (status === "playing" && isOwner) {
       actions += '<button class="btn" id="finish-race">结束比赛</button>';
     }
+    if ((status === "draft" || status === "open") && (isOwner || myRole === "admin")) {
+      actions += '<button class="btn danger" id="cancel-race">取消比赛</button>';
+    }
     if (actions) html += '<div class="card">' + actions + "</div>";
 
     if (status === "open" || status === "playing") {
+      const active = participants.filter((p) => !p.waitlisted);
+      const waiting = participants.filter((p) => p.waitlisted);
       html +=
-        '<div class="card"><div class="field-label">报名（' + participants.length +
-        (race.maxPlayers ? "/" + race.maxPlayers : "") + "）</div>" +
+        '<div class="card"><div class="field-label">报名（' + active.length +
+        (race.maxPlayers ? "/" + race.maxPlayers : "") + "）" +
+        (waiting.length ? " · 候补 " + waiting.length : "") + "</div>" +
         (participants.length
-          ? participants
+          ? active
               .map(
-                p =>
+                (p) =>
                   '<div class="player-row"><span class="name">' + esc(p.name) + "</span>" +
-                  '<span class="tag">' + (p.gender === "F" ? "女" : "男") + " · " + p.level + "级</span></div>"
+                  '<span class="tag">' + (p.gender === "F" ? "女" : "男") + " · " + p.level + "级</span>" +
+                  (isOwner || myRole === "admin"
+                    ? '<button class="del" data-kick="' + esc(p.user_id) + '">×</button>'
+                    : "") +
+                  "</div>"
               )
-              .join("")
+              .join("") +
+            (waiting.length
+              ? '<div class="field-label" style="margin-top:10px">候补（' + waiting.length + "）</div>" +
+                waiting
+                  .map(
+                    (p) =>
+                      '<div class="player-row"><span class="name">' + esc(p.name) + "</span>" +
+                      '<span class="tag">候补</span></div>'
+                  )
+                  .join("")
+              : "")
           : '<div class="meta">还没有人报名</div>') +
         "</div>";
     }
@@ -541,6 +589,46 @@
         ]);
       };
     }
+
+    const cancelBtn = view.querySelector("#cancel-race");
+    if (cancelBtn) {
+      cancelBtn.onclick = () =>
+        modal("取消这场比赛？已报名的人会看到「已取消」。", [
+          { label: "不取消" },
+          {
+            label: "取消比赛",
+            primary: true,
+            fn: async () => {
+              try {
+                await S.cancelRace(race.id);
+                await S.pull();
+                renderRace(S.getRace(race.id), tab);
+              } catch (e) {
+                modal((e && e.detail) || "取消失败");
+              }
+            }
+          }
+        ]);
+    }
+
+    view.querySelectorAll("[data-kick]").forEach((btn) => {
+      btn.onclick = () =>
+        modal("移出这位成员？若有候补会自动递补。", [
+          { label: "取消" },
+          {
+            label: "移出",
+            primary: true,
+            fn: async () => {
+              try {
+                await S.kickParticipant(race.id, btn.dataset.kick);
+                renderRace(S.getRace(race.id), tab);
+              } catch (e) {
+                modal((e && e.detail) || "操作失败");
+              }
+            }
+          }
+        ]);
+    });
 
     const finishBtn = view.querySelector("#finish-race");
     if (finishBtn) {
@@ -683,7 +771,12 @@
         '<div class="card"><div class="meta">你已报名</div>' +
         '<div class="field-label" style="margin-top:10px">报名名单</div>' +
         info.participants
-          .map(p => '<div class="player-row"><span class="name">' + esc(p.name) + "</span></div>")
+          .map(
+            (p) =>
+              '<div class="player-row"><span class="name">' + esc(p.name) + "</span>" +
+              (p.waitlisted ? '<span class="tag">候补</span>' : "") +
+              "</div>"
+          )
           .join("") +
         "</div>" +
         '<button class="btn" id="enter">进入比赛</button>' +
@@ -757,8 +850,33 @@
         S.setMe(name);
         S.pull();
         renderJoin(code);
-      } catch (e) {
-        modal((e && e.detail) || "报名失败");
+      } catch (err) {
+        const detail = (err && err.detail) || "报名失败";
+        if (detail.indexOf("满") >= 0) {
+          return modal("已满员，进入候补队列？有人退出会自动递补。", [
+            { label: "取消" },
+            {
+              label: "进候补",
+              primary: true,
+              fn: async () => {
+                try {
+                  await S.joinWaitlist(race.id, {
+                    name,
+                    avatar: pickedAvatar || undefined,
+                    gender,
+                    level: Number(document.getElementById("jlevel").value)
+                  });
+                  S.setMe(name);
+                  S.pull();
+                  renderJoin(code);
+                } catch (e2) {
+                  modal((e2 && e2.detail) || "候补失败");
+                }
+              }
+            }
+          ]);
+        }
+        modal(detail);
       }
     };
   }
@@ -889,24 +1007,29 @@
       '<div class="chips">' +
       chips.map((c, i) => '<button data-quick="' + i + '">' + esc(c.label) + '</button>').join('') +
       '</div>' +
-      '<button class="btn secondary" id="cede" style="margin-top:12px">让分</button>' +
+      '<div class="segmented" style="margin-top:12px">' +
+      '<button id="undo" ' + ((match.history || []).length ? "" : "disabled") + '>↶ 撤销</button>' +
+      '<button id="cede">让分</button>' +
+      "</div>" +
       '<button class="btn" id="commit" style="margin-top:12px">' +
       (chase ? '完成本场' : '完成本局') + '</button>' +
       (match.status === 'done' ? '<button class="btn danger" id="reset" style="margin-top:10px">重置本场</button>' : '') +
       '</div>' +
       setsHTML(match);
 
-    view.querySelectorAll('[data-plus]').forEach(btn => {
+    view.querySelectorAll("[data-plus]").forEach(btn => {
       btn.onclick = () => {
         const side = Number(btn.dataset.plus);
+        pushUndo(match, snapshotOf(match));
         match.crt[side] = Math.min(9999, match.crt[side] + 1);
         S.cache(race);
         renderMatch(race, mid);
       };
     });
-    view.querySelectorAll('[data-minus]').forEach(btn => {
+    view.querySelectorAll("[data-minus]").forEach(btn => {
       btn.onclick = () => {
         const side = Number(btn.dataset.minus);
+        pushUndo(match, snapshotOf(match));
         match.crt[side] = Math.max(0, match.crt[side] - 1);
         S.cache(race);
         renderMatch(race, mid);
@@ -921,7 +1044,17 @@
       };
     });
 
-    document.getElementById('cede').onclick = () => {
+    const undoBtn = document.getElementById("undo");
+    if (undoBtn) {
+      undoBtn.onclick = async () => {
+        if (!undoScore(race, match)) return modal("没有可撤销的操作");
+        await S.updateMatch(race.id, match);
+        renderMatch(race, mid);
+      };
+    }
+
+    document.getElementById("cede").onclick = () => {
+      pushUndo(match, snapshotOf(match));
       const cp = R.cedePoint(match.side1, match.side2, race.players, race.balls);
       if (!cp) return modal('对阵双方性别相同，或当前分制没有默认让分');
       const b = chase ? chaseBase(race, match) : [0, 0];
@@ -1067,6 +1200,11 @@
 
   async function renderCreate() {
     if (!draft) draft = blankDraft();
+    try {
+      PRESETS = await S.presets();
+    } catch (e) {
+      PRESETS = [];
+    }
     topbar.innerHTML = topbarHTML({ title: '新建比赛', back: true });
     wireTopbar({});
 
@@ -1084,7 +1222,20 @@
     );
     const isTeam = draft.group === 'match' || draft.group === 'teams';
 
-    let html =
+    let html = "";
+    if (PRESETS.length) {
+      html +=
+        '<div class="card"><div class="field-label">常用模板</div><div class="segmented">' +
+        PRESETS
+          .map(
+            (p) =>
+              '<button data-preset="' + esc(p.id) + '">' + esc(p.name) + "</button>"
+          )
+          .join("") +
+        '</div><div class="hint">点一下套用，可再改</div></div>';
+    }
+
+    html +=
       '<div class="card">' +
       '<div class="field"><label>比赛名称</label>' +
       '<input type="text" id="race-name" value="' + esc(draft.name) + '"></div>' +
@@ -1187,7 +1338,9 @@
     html += draft.signup && !isTeam
       ? '<div class="card"><div class="meta">报名制：选手通过报名链接加入，人齐后由你开始比赛并自动生成对阵。</div></div>'
       : isTeam ? teamsForm() : playersForm();
-    html += '<button class="btn" id="create">生成对阵</button>';
+    html +=
+      '<button class="btn secondary" id="save-preset">存为常用模板</button>' +
+      '<button class="btn" id="create">生成对阵</button>';
     view.innerHTML = html;
     wireCreate();
   }
@@ -1388,6 +1541,55 @@
       draft.teams.push({ name: String.fromCharCode(65 + draft.teams.length) + ' 队', players: [] });
       renderCreate();
     };
+
+    view.querySelectorAll("[data-preset]").forEach((btn) => {
+      btn.onclick = () => {
+        const preset = PRESETS.find((p) => p.id === btn.dataset.preset);
+        if (!preset) return;
+        draft = Object.assign(blankDraft(), {
+          name: preset.name || draft.name,
+          group: preset.group || draft.group,
+          mode: preset.mode || draft.mode,
+          rounds: preset.rounds || draft.rounds,
+          balls: preset.balls || draft.balls,
+          courts: preset.courts || 0,
+          signup: preset.signup !== false,
+          partnerMode: preset.partnerMode || draft.partnerMode,
+          wheelMode: preset.wheelMode || draft.wheelMode,
+          rankMode: preset.rankMode || draft.rankMode,
+          matchesPerEntity: preset.matchesPerEntity || draft.matchesPerEntity,
+          arenaKings: preset.arenaKings || draft.arenaKings,
+          groupSize: preset.groupSize || draft.groupSize,
+          venueId: preset.venueId || ""
+        });
+        renderCreate();
+      };
+    });
+
+    const savePresetBtn = view.querySelector("#save-preset");
+    if (savePresetBtn) {
+      savePresetBtn.onclick = () => {
+        const name = (draft.name || "模板").trim();
+        S.savePreset(name, {
+          name,
+          group: draft.group,
+          mode: draft.mode,
+          rounds: draft.rounds,
+          balls: draft.balls,
+          courts: draft.courts,
+          signup: draft.signup,
+          partnerMode: draft.partnerMode,
+          wheelMode: draft.wheelMode,
+          rankMode: draft.rankMode,
+          matchesPerEntity: draft.matchesPerEntity,
+          arenaKings: draft.arenaKings,
+          groupSize: draft.groupSize,
+          venueId: draft.venueId
+        })
+          .then(() => modal("已存为模板", [{ label: "好的", primary: true }]))
+          .catch((e) => modal((e && e.detail) || "保存失败"));
+      };
+    }
 
     view.querySelector('#create').onclick = createRace;
   }

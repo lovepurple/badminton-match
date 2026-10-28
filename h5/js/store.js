@@ -365,6 +365,30 @@ if (!state.avatar) state.avatar = "";
     return updated;
   }
 
+  async function presets() {
+    return (await call('/api/presets')).presets || [];
+  }
+
+  async function savePreset(name, data) {
+    return call('/api/presets', { method: 'POST', data: { name, data } });
+  }
+
+  async function removePreset(id) {
+    return call('/api/presets/' + id, { method: 'DELETE' });
+  }
+
+  async function cancelRace(raceId) {
+    return call('/api/races/' + raceId + '/cancel', { method: 'POST' });
+  }
+
+  async function joinWaitlist(raceId, profile) {
+    return call('/api/races/' + raceId + '/waitlist', { method: 'POST', data: profile });
+  }
+
+  async function kickParticipant(raceId, targetId) {
+    return call('/api/races/' + raceId + '/participants/' + targetId, { method: 'DELETE' });
+  }
+
   async function adminFinish(raceId) {
     return call('/api/admin/races/' + raceId + '/finish', { method: 'POST' });
   }
@@ -415,6 +439,12 @@ if (!state.avatar) state.avatar = "";
     setMe,
     avatar,
     updateProfile,
+    presets,
+    savePreset,
+    removePreset,
+    cancelRace,
+    joinWaitlist,
+    kickParticipant,
     adminFinish,
     people
   };

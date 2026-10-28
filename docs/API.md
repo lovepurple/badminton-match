@@ -104,6 +104,10 @@ Base：`http://<host>:18000`（端口可改）。除 `POST /api/auth/login` 与 
 | GET | `/api/races/{id}/participants` | 报名名单 + `isOwner` + `status` + `joinCode` |
 | POST | `/api/races/{id}/start` | 开始比赛，body `{"players":[...],"matches":[...]}`（对阵由客户端生成） |
 | POST | `/api/races/{id}/finish` | 结束比赛，返回汇总 |
+| POST | `/api/races/{id}/cancel` | 取消比赛（创建者/管理员，未开始时） |
+| POST | `/api/races/{id}/waitlist` | 满员时进入候补队列 |
+| DELETE | `/api/races/{id}/participants/{uid}` | 移出成员（创建者/管理员），自动递补候补第一个 |
+| GET/POST/DELETE | `/api/presets` | 常用模板（每人私有） |
 | GET | `/api/races/{id}/live?since=<updatedAt>` | 实时轮询（创建者/成员/管理员）；访客 403 |
 | GET | `/api/races/{id}/summary` | 汇总：最终排名 + 全部对阵 |
 
