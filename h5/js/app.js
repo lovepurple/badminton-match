@@ -27,8 +27,24 @@
     });
   }
 
-  function modal(text, actions) {
+  let modalInput = null;
+
+  function modal(text, actions, opts) {
+    opts = opts || {};
     document.getElementById('modal-text').textContent = text;
+
+    let input = null;
+    if (opts.input) {
+      input = document.createElement('input');
+      input.type = opts.input.type || 'text';
+      input.id = 'modal-input';
+      input.value = opts.input.value == null ? '' : opts.input.value;
+      input.placeholder = opts.input.placeholder || '';
+      const p = document.getElementById('modal-text');
+      p.insertAdjacentElement('afterend', input);
+      modalInput = input;
+    }
+
     const box = document.getElementById('modal-actions');
     box.innerHTML = '';
     (actions || [{ label: '知道了', primary: true }]).forEach(action => {
@@ -36,8 +52,10 @@
       btn.textContent = action.label;
       if (action.primary) btn.className = 'primary';
       btn.onclick = () => {
+        const value = input ? input.value.trim() : undefined;
         closeModal();
-        if (action.fn) action.fn();
+        if (action.fn) action.fn(value);
+        else if (action.primary && opts.onConfirm) opts.onConfirm(value);
       };
       box.appendChild(btn);
     });
@@ -45,7 +63,32 @@
   }
 
   function closeModal() {
+    const stale = document.getElementById('modal-input');
+    if (stale) stale.remove();
+    modalInput = null;
     document.getElementById('modal').hidden = true;
+  }
+
+  function askText(title, value, placeholder) {
+    return new Promise(resolve => {
+      let settled = false;
+      modal(title, [
+        { label: '取消', fn: () => { if (!settled) { settled = true; resolve(null); } } },
+        {
+          label: '确定',
+          primary: true,
+          fn: v => { if (!settled) { settled = true; resolve(v == null ? '' : v); } }
+        }
+      ], { input: { value: value == null ? '' : value, placeholder: placeholder || '' } });
+    });
+  }
+
+  function askNumber(title, value) {
+    return askText(title, value == null ? 0 : value, '').then(raw => {
+      if (raw === null) return null;
+      const n = parseInt(raw, 10);
+      return isNaN(n) || n < 0 ? 0 : n;
+    });
   }
 
   function go(hash) {
@@ -265,9 +308,23 @@
 
   /* ---------------- 路由 ---------------- */
 
+  function parseQuery(hash) {
+    const i = hash.indexOf('?');
+    const out = {};
+    if (i < 0) return out;
+    hash.slice(i + 1).split('&').forEach(pair => {
+      if (!pair) return;
+      const k = pair.split('=')[0];
+      const v = pair.slice(k.length + 1);
+      out[decodeURIComponent(k)] = decodeURIComponent(v.replace(/\+/g, ' '));
+    });
+    return out;
+  }
+
   async function route() {
     const hash = location.hash.replace(/^#/, '') || '/';
-    const parts = hash.split('/').filter(Boolean);
+    const query = parseQuery(hash);
+    const parts = hash.split('?')[0].split('/').filter(Boolean);
     tabbar.querySelectorAll('a').forEach(a => {
       a.classList.toggle(
         'active',
@@ -278,7 +335,7 @@
 
     if (!parts.length) return renderRaces();
     stopPolling();
-    if (parts[0] === 'stats') return renderStats();
+    if (parts[0] === 'stats') return renderStats(query);
     if (parts[0] === 'me') return renderMe();
     if (parts[0] === 'create') return renderCreate();
     if (parts[0] === 'join') return renderJoin(parts[1]);
@@ -467,6 +524,9 @@
     if ((status === "draft" || status === "open") && (isOwner || myRole === "admin")) {
       actions += '<button class="btn danger" id="cancel-race">取消比赛</button>';
     }
+    if (status === "done" && (isOwner || myRole === "admin")) {
+      actions += '<button class="btn secondary" id="reopen-race">重新打开改分</button>';
+    }
     if (actions) html += '<div class="card">' + actions + "</div>";
 
     if (status === "open" || status === "playing") {
@@ -533,14 +593,43 @@
 
     const openBtn = view.querySelector("#open-signup");
     if (openBtn) {
-      openBtn.onclick = async () => {
-        try {
-          await S.openSignup(race, 0);
-          renderRace(S.getRace(race.id), tab);
-        } catch (e) {
-          modal((e && e.detail) || "开放报名失败");
-        }
+      openBtn.onclick = () => {
+        askNumber("报名人数上限（0 = 不限，满员自动进候补）", race.maxPlayers || 0).then(limit => {
+          if (limit === null) return;
+          askText("报名截止（留空 = 不截止）", "", "例：2026-11-01 20:00").then(raw => {
+            let deadline = null;
+            if (raw && raw.trim()) {
+              const d = new Date(raw.trim().replace(" ", "T"));
+              if (isNaN(d.getTime())) return modal("时间格式看不懂，例：2026-11-01 20:00");
+              deadline = d.toISOString();
+            }
+            S.openSignup(race, limit, deadline)
+              .then(() => renderRace(S.getRace(race.id), tab))
+              .catch(e => modal((e && e.detail) || "开放报名失败"));
+          });
+        });
       };
+    }
+
+    const reopenBtn = view.querySelector("#reopen-race");
+    if (reopenBtn) {
+      reopenBtn.onclick = () =>
+        modal("重新打开后可以改比分，改完再结束一次即可。", [
+          { label: "取消" },
+          {
+            label: "重新打开",
+            primary: true,
+            fn: async () => {
+              try {
+                await S.reopenRace(race.id);
+                const fresh = await S.fetchRace(race.id);
+                renderRace(fresh, tab);
+              } catch (e) {
+                modal((e && e.detail) || "操作失败");
+              }
+            }
+          }
+        ]);
     }
 
     const copyBtn = view.querySelector("#copy-link");
@@ -721,6 +810,44 @@
 
   /* ---------------- 报名页 ---------------- */
 
+  async function fillFriends() {
+    const box = document.getElementById("j-friends");
+    if (!box) return;
+    let people = [];
+    try {
+      people = await S.acquaintances();
+    } catch (e) {
+      return;
+    }
+    if (!people.length) return;
+    box.className = "field";
+    box.innerHTML =
+      '<label>常用球友（点一下自动填）</label><div class="chips">' +
+      people
+        .map(
+          (p, i) =>
+            '<button class="chip" data-friend="' + i + '">' + esc(p.name) +
+            (p.level ? '<span class="tag">' + p.level + "级</span>" : "") + "</button>"
+        )
+        .join("") +
+      "</div>";
+    box.querySelectorAll("[data-friend]").forEach(btn => {
+      btn.onclick = () => {
+        const p = people[Number(btn.dataset.friend)];
+        const name = document.getElementById("jname");
+        if (name) {
+          name.value = p.name;
+          name.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        document.querySelectorAll("[data-gender]").forEach(b => {
+          b.classList.toggle("on", b.dataset.gender === (p.gender || "M"));
+        });
+        const lv = document.getElementById("jlevel");
+        if (lv && p.level != null) lv.value = String(p.level);
+      };
+    });
+  }
+
   async function renderJoin(code) {
     topbar.innerHTML = topbarHTML({ title: "报名", back: true });
     wireTopbar({});
@@ -800,6 +927,7 @@
       '<div class="card">' +
       '<div class="field"><label>你的名字</label>' +
       '<input type="text" id="jname" value="' + esc(S.me()) + '" placeholder="例如：阿豪"></div>' +
+      '<div id="j-friends"></div>' +
       '<div class="field"><label>头像（可跳过，报名后自动带上）</label>' +
       avatarHTML(S.avatar(), "small") +
       '<input type="file" id="j-avatar" accept="image/*" style="display:none">' +
@@ -836,6 +964,8 @@
         view.querySelectorAll("[data-gender]").forEach(b => b.classList.toggle("on", b === btn));
       };
     });
+
+    fillFriends();
 
     document.getElementById("join").onclick = async () => {
       const name = document.getElementById("jname").value.trim();
@@ -1345,6 +1475,38 @@
     wireCreate();
   }
 
+  async function fillCreateFriends() {
+    const box = document.getElementById("create-friends");
+    if (!box) return;
+    let people = [];
+    try {
+      people = await S.acquaintances();
+    } catch (e) {
+      return;
+    }
+    const existing = new Set(draft.players.map(p => p.name));
+    const fresh = people.filter(p => !existing.has(p.name));
+    if (!fresh.length) return;
+    box.innerHTML =
+      '<div class="hint" style="margin-top:10px">常用球友（点一下加入）</div><div class="chips">' +
+      fresh
+        .map((p, i) => '<button class="chip" data-cfriend="' + i + '">' + esc(p.name) + "</button>")
+        .join("") +
+      "</div>";
+    box.querySelectorAll("[data-cfriend]").forEach(btn => {
+      btn.onclick = () => {
+        const p = fresh[Number(btn.dataset.cfriend)];
+        draft.players.push({
+          id: S.uid(),
+          name: p.name,
+          gender: p.gender || "M",
+          level: p.level || 0
+        });
+        renderCreate();
+      };
+    });
+  }
+
   function playersForm() {
     return (
       '<div class="card"><div class="field"><label>选手（' + draft.players.length + ' 人）</label>' +
@@ -1361,7 +1523,8 @@
       '<select id="pgender"><option value="M">男</option><option value="F">女</option></select>' +
       '<select id="plevel">' + levelOptions() + '</select>' +
       '<button class="ghost" id="padd">添加</button></div>' +
-      '<div class="hint">批量：张三,李四,王五（按当前性别 / 等级添加）</div></div></div>'
+      '<div class="hint">批量：张三,李四,王五（按当前性别 / 等级添加）</div>' +
+      '<div id="create-friends"></div></div></div>'
     );
   }
 
@@ -1501,6 +1664,8 @@
       });
       renderCreate();
     };
+    fillCreateFriends();
+
     view.querySelectorAll('[data-del]').forEach(btn => {
       btn.onclick = () => {
         draft.players.splice(Number(btn.dataset.del), 1);
@@ -1728,36 +1893,54 @@
 
   /* ---------------- 战绩 ---------------- */
 
-  async function renderStats() {
+  async function renderStats(query) {
     topbar.innerHTML = topbarHTML({ title: '战绩', brand: true });
     wireTopbar({});
 
-    const me = S.me();
-    const stats = K.personalStats(S.races(), me);
-    const pct = s => (s.alls ? Math.round((s.wins / s.alls) * 100) + '%' : '—');
+    const who = (query && query.name) || '';
+    let stats = null;
+    let err = '';
+    try {
+      stats = who ? await S.statsOf(who) : await S.myStats();
+    } catch (e) {
+      err = (e && e.detail) || '统计加载失败';
+    }
+
+    const pct = v => (v.alls ? Math.round((v.wins / v.alls) * 100) + '%' : '—');
+    const title = who ? who + ' 的战绩' : (S.me() || '我') + ' 的战绩';
+
+    if (!stats) {
+      view.innerHTML = '<div class="card"><div class="meta">' + esc(err) + '</div></div>';
+      return;
+    }
 
     view.innerHTML =
-      '<div class="card">' +
-      '<div class="field"><label>我的名字（与比赛中的选手名一致）</label>' +
-      '<input type="text" id="me" value="' + esc(me) + '" placeholder="输入名字"></div>' +
-      '<div class="meta">跨所有比赛的统计</div></div>' +
+      '<div class="card"><div class="row-between"><h3>' + esc(title) + '</h3>' +
+      '<button class="ghost" id="search-other">查别人</button></div>' +
+      '<div class="meta">' + (who ? '按名字匹配' : '按你的账号身份匹配，改昵称也不丢') + '</div></div>' +
       '<div class="stat-grid">' +
       statCard('总场次', stats.total.alls) +
       statCard('胜率', pct(stats.total)) +
       statCard('单打胜率', pct(stats.singles)) +
       statCard('双打胜率', pct(stats.doubles)) +
       '</div>' +
-      (me
-        ? '<div class="card" style="margin-top:12px"><h3>' + esc(me) + '</h3>' +
-          '<div class="meta">' + stats.total.wins + ' 胜 / ' + stats.total.fail + ' 负' +
-          (stats.total.even ? ' / ' + stats.total.even + ' 平' : '') +
-          ' · 共 ' + stats.rounds + ' 局</div></div>'
-        : '');
+      '<div class="card" style="margin-top:12px"><h3>' + esc(stats.name || title) + '</h3>' +
+      '<div class="meta">' + stats.total.wins + ' 胜 / ' + stats.total.fail + ' 负' +
+      (stats.total.even ? ' / ' + stats.total.even + ' 平' : '') +
+      ' · 共 ' + stats.rounds + ' 局</div>' +
+      (stats.total.alls === 0
+        ? '<div class="meta">还没有打完的比赛，去开一局吧。</div>'
+        : '') +
+      '</div>';
 
-    const input = view.querySelector('#me');
-    input.onchange = () => {
-      S.setMe(input.value.trim());
-      renderStats();
+    view.querySelector('#search-other').onclick = () => {
+      modal('输入要查的名字', [{ label: '取消' }], {
+        input: { value: who, placeholder: '选手昵称' },
+        onConfirm: name => {
+          if (!name) return;
+          location.hash = '#/stats?name=' + encodeURIComponent(name);
+        }
+      });
     };
   }
 

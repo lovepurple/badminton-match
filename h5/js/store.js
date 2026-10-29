@@ -248,10 +248,10 @@ if (!state.avatar) state.avatar = "";
 
   /* ---- 报名 / 比赛流程 ---- */
 
-  async function openSignup(race, maxPlayers) {
+  async function openSignup(race, maxPlayers, deadline) {
     const doc = await call('/api/races/' + race.id + '/open', {
       method: 'POST',
-      data: { maxPlayers: maxPlayers || 0 }
+      data: { maxPlayers: maxPlayers || 0, deadline: deadline || null }
     });
     replaceLocal(strip(doc));
     save();
@@ -365,6 +365,23 @@ if (!state.avatar) state.avatar = "";
     return updated;
   }
 
+  async function acquaintances() {
+    return (await call('/api/acquaintances')).people || [];
+  }
+
+  async function myStats() {
+    return call('/api/stats?mine=true');
+  }
+
+  async function statsOf(name) {
+    if (!name) return call('/api/stats?mine=true');
+    return call('/api/stats?name=' + encodeURIComponent(name));
+  }
+
+  async function reopenRace(raceId) {
+    return call('/api/races/' + raceId + '/reopen', { method: 'POST' });
+  }
+
   async function presets() {
     return (await call('/api/presets')).presets || [];
   }
@@ -440,6 +457,10 @@ if (!state.avatar) state.avatar = "";
     avatar,
     updateProfile,
     presets,
+    acquaintances,
+    myStats,
+    statsOf,
+    reopenRace,
     savePreset,
     removePreset,
     cancelRace,

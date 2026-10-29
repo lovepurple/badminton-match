@@ -134,6 +134,7 @@ class PresetIdIn(BaseModel):
 
 class OpenIn(BaseModel):
     maxPlayers: int = 0
+    deadline: str | None = None
 
 
 class JoinIn(BaseModel):
@@ -164,6 +165,7 @@ class RaceIn(BaseModel):
     groupSize: int = 4
     groupsValid: int = 3
     date: str | None = None
+    signupDeadline: str | None = None
     courts: int = 0
     playName: str | None = None
     playRules: dict | None = None
@@ -484,8 +486,11 @@ def open_signup(
         raise HTTPException(status_code=409, detail="比赛已开始或已结束")
     race["joinCode"] = race.get("joinCode") or _new_join_code()
     race["status"] = "open"
-    if body and body.maxPlayers:
-        race["maxPlayers"] = body.maxPlayers
+    if body:
+        if body.maxPlayers:
+            race["maxPlayers"] = body.maxPlayers
+        if body.deadline:
+            race["signupDeadline"] = body.deadline
     race.setdefault("maxPlayers", 0)
     return _race_for_view(db.save_race(user_id, race))
 
@@ -693,9 +698,22 @@ def index() -> RedirectResponse:
 
 
 @app.get("/api/stats")
-def stats(name: str = Query(..., min_length=1), user_id: str = Depends(current_user)) -> dict:
+def stats(
+    name: str | None = Query(default=None),
+    mine: bool = Query(default=False),
+    user_id: str = Depends(current_user),
+) -> dict:
+    """战绩统计。mine=true 用当前登录身份匹配（改昵称不丢数据）；否则按名字查。"""
+    if not mine and not (name and name.strip()):
+        raise HTTPException(status_code=422, detail="需要 name 或 mine=true")
     races = [db.get_race(item["id"]) for item in db.list_races(user_id)]
-    return rules.personal_stats([r for r in races if r], name)
+    me = db.get_user(user_id) or {}
+    target_name = (name or "").strip() or me.get("nickname") or ""
+    return rules.personal_stats(
+        [r for r in races if r],
+        target_name,
+        user_id if mine else None,
+    )
 
 
 class UserRoleIn(BaseModel):
@@ -756,6 +774,8 @@ def join_waitlist(race_id: str, body: JoinIn, user_id: str = Depends(current_use
         raise HTTPException(status_code=404, detail="比赛不存在")
     if race.get("status") != "open":
         raise HTTPException(status_code=409, detail="当前不在报名阶段")
+    if _deadline_passed(race):
+        raise HTTPException(status_code=409, detail="报名已截止")
     participants = db.list_participants(race_id)
     limit = race.get("maxPlayers") or 0
     already = next((p for p in participants if p["user_id"] == user_id), None)
@@ -798,10 +818,24 @@ def kick_participant(
 
 
 # 让报名直接复用加入逻辑但区分候补：改造 join
+def _deadline_passed(race) -> bool:
+    dl = race.get("signupDeadline")
+    if not dl:
+        return False
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(dl.replace("Z", "+00:00"))
+        return datetime.now(dt.tzinfo) > dt
+    except Exception:
+        return False
+
+
 def _join_impl(race_id, body, user_id):
     race = db.get_race(race_id)
     if not race or race.get("status") != "open":
         raise HTTPException(status_code=409, detail="当前不在报名阶段")
+    if _deadline_passed(race):
+        raise HTTPException(status_code=409, detail="报名已截止")
     participants = db.list_participants(race_id)
     limit = race.get("maxPlayers") or 0
     already = next((p for p in participants if p["user_id"] == user_id), None)
@@ -852,6 +886,27 @@ def admin_finish_race(race_id: str, user_id: str = Depends(require_admin)) -> di
     race["status"] = "done"
     db.save_race(race.get("_ownerId") or user_id, race)
     return summary(race_id, user_id)
+
+
+@app.get("/api/acquaintances")
+def acquaintances(user_id: str = Depends(current_user)) -> dict:
+    """当前用户以往报名过的球友（用于一键选择）。"""
+    return {"people": rules.acquaintances(db.list_races_all(), user_id, db.list_participants)}
+
+
+# 补录比分：已结束的比赛 reopen 后改分
+@app.post("/api/races/{race_id}/reopen")
+def reopen_race(race_id: str, user_id: str = Depends(current_user)) -> dict:
+    race = db.get_race(race_id)
+    if not race:
+        raise HTTPException(status_code=404, detail="比赛不存在")
+    if race.get("_ownerId") != user_id and not _is_admin(user_id):
+        raise HTTPException(status_code=403, detail="只有创建者可以重新打开")
+    if race.get("status") != "done":
+        raise HTTPException(status_code=409, detail="只有已结束的比赛可以重新打开")
+    race["status"] = "playing"
+    db.save_race(race.get("_ownerId") or user_id, race)
+    return {"ok": True, "status": "playing"}
 
 
 @app.get("/api/people")

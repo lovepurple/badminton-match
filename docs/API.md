@@ -108,6 +108,9 @@ Base：`http://<host>:18000`（端口可改）。除 `POST /api/auth/login` 与 
 | POST | `/api/races/{id}/waitlist` | 满员时进入候补队列 |
 | DELETE | `/api/races/{id}/participants/{uid}` | 移出成员（创建者/管理员），自动递补候补第一个 |
 | GET/POST/DELETE | `/api/presets` | 常用模板（每人私有） |
+| GET | `/api/acquaintances` | 以往同场的球友（一键选人） |
+| POST | `/api/races/{id}/reopen` | 重新打开已结束的比赛以改分 |
+| GET | `/api/stats?mine=true` | 按登录身份统计战绩（改昵称不丢） |
 | GET | `/api/races/{id}/live?since=<updatedAt>` | 实时轮询（创建者/成员/管理员）；访客 403 |
 | GET | `/api/races/{id}/summary` | 汇总：最终排名 + 全部对阵 |
 

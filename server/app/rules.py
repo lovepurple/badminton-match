@@ -184,8 +184,12 @@ def compute(race: dict) -> dict:
     return {"kind": kind, "rows": [rows[i] for i in order]}
 
 
-def personal_stats(races: list[dict], name: str) -> dict:
-    """跨比赛统计某个名字的场次与单/双打胜率。"""
+def personal_stats(races: list[dict], name: str, user_id: str | None = None) -> dict:
+    """跨比赛统计某人的场次与单/双打胜率。
+
+    优先按 user_id 匹配（报名即身份，选手 id 就是用户 id），没有再退回按名字匹配，
+    这样改昵称后历史战绩不会丢。
+    """
     total = {"alls": 0, "wins": 0, "fail": 0, "even": 0}
     singles = {"alls": 0, "wins": 0, "fail": 0, "even": 0}
     doubles = {"alls": 0, "wins": 0, "fail": 0, "even": 0}
@@ -203,7 +207,10 @@ def personal_stats(races: list[dict], name: str) -> dict:
             ids = (m.get("side1") or []) + (m.get("side2") or [])
             mine = -1
             for p in race.get("players") or []:
-                if p.get("name") == name and p.get("id") in ids:
+                if p.get("id") not in ids:
+                    continue
+                hit = (user_id and p.get("id") == user_id) or (name and p.get("name") == name)
+                if hit:
                     mine = 0 if p["id"] in (m.get("side1") or []) else 1
             if mine < 0:
                 continue
@@ -229,7 +236,14 @@ def personal_stats(races: list[dict], name: str) -> dict:
                 bucket["fail"] += 1
             rounds += len(sets)
 
-    return {"total": total, "singles": singles, "doubles": doubles, "rounds": rounds}
+    return {
+        "total": total,
+        "singles": singles,
+        "doubles": doubles,
+        "rounds": rounds,
+        "name": name,
+        "userId": user_id,
+    }
 
 
 def person_stats(races: list[dict], participants_fn) -> list[dict]:
@@ -312,3 +326,32 @@ def person_stats(races: list[dict], participants_fn) -> list[dict]:
         u["rate"] = round(u["wins"] / u["alls"], 4) if u["alls"] else None
     people.sort(key=lambda u: (-u["alls"], u["name"]))
     return people
+
+
+def acquaintances(races: list[dict], user_id: str, participants_fn) -> list[dict]:
+    """当前用户报名过的比赛里，别的参赛者的最新档案（一键选球友）。
+
+    participants_fn(race_id) -> participants。去重取最新一次报名资料，最多 20 人。
+    """
+    seen: dict[str, dict] = {}
+    ordered: list[str] = []
+    for race in races:
+        if race.get("status") == "draft":
+            continue
+        parts = participants_fn(race["id"])
+        mine = any(p["user_id"] == user_id for p in parts)
+        if not mine:
+            continue
+        for p in parts:
+            if p["user_id"] == user_id:
+                continue
+            if p["user_id"] not in seen:
+                seen[p["user_id"]] = {
+                    "id": p["user_id"],
+                    "name": p.get("name") or "",
+                    "avatar": p.get("avatar"),
+                    "gender": p.get("gender") or "M",
+                    "level": p.get("level") or 0,
+                }
+                ordered.append(p["user_id"])
+    return [seen[uid] for uid in ordered[-20:]]

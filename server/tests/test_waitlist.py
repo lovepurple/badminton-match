@@ -114,3 +114,125 @@ def test_presets_crud():
         assert not any(
             p["id"] == preset_id for p in client.get("/api/presets", headers=admin).json()["presets"]
         )
+
+
+def test_signup_deadline_blocks_joining():
+    from datetime import datetime, timedelta
+    with TestClient(app) as client:
+        admin = login(client, "venue-admin")
+        late = login(client, "dl-late")
+        race(client, admin, "dl_race", max_players=8)
+        past = (datetime.now() - timedelta(minutes=5)).replace(microsecond=0).isoformat()
+        client.post(
+            "/api/races/dl_race/open",
+            json={"maxPlayers": 8, "deadline": past},
+            headers=admin,
+        )
+        res = client.post("/api/races/dl_race/join", json={"name": "路人"}, headers=late)
+        assert res.status_code == 409
+        assert "截止" in res.json()["detail"]
+
+
+def test_acquaintances_from_joined_races():
+    with TestClient(app) as client:
+        admin = login(client, "venue-admin")
+        me = login(client, "aq-me")
+        friend = login(client, "aq-friend")
+        race(client, admin, "aq_race", max_players=8)
+        client.post("/api/races/aq_race/join", json={"name": "我"}, headers=me)
+        client.post("/api/races/aq_race/join", json={"name": "老友", "gender": "M", "level": 5}, headers=friend)
+
+        people = client.get("/api/acquaintances", headers=me).json()["people"]
+        hit = [p for p in people if p["id"] == "dev_aq-friend"]
+        assert hit and hit[0]["name"] == "老友" and hit[0]["level"] == 5
+
+        # 反向：只有一方报名不会出现
+        alone = login(client, "aq-alone")
+        race(client, admin, "aq_race2", max_players=8)
+        client.post("/api/races/aq_race2/join", json={"name": "独行"}, headers=alone)
+        people2 = client.get("/api/acquaintances", headers=me).json()["people"]
+        assert not any(p["id"] == "dev_aq-alone" for p in people2)
+
+
+def test_reopen_done_race():
+    with TestClient(app) as client:
+        admin = login(client, "venue-admin")
+        owner = login(client, "reopen-owner")
+        payload = {
+            "id": "reopen_race",
+            "name": "重开测试",
+            "mode": "singlesRound",
+            "group": "singles",
+            "rounds": 3,
+            "balls": 21,
+            "players": [],
+            "teams": [],
+            "matches": [],
+        }
+        client.post("/api/races", json=payload, headers=owner)
+        client.post("/api/races/reopen_race/open", headers=owner)
+        start = {
+            "players": [
+                {"id": "dev_reopen-a", "name": "甲", "gender": "M", "level": 1},
+                {"id": "dev_reopen-b", "name": "乙", "gender": "M", "level": 2},
+            ],
+            "matches": [
+                {
+                    "id": "reopen_m1",
+                    "round": 1,
+                    "court": 1,
+                    "side1": ["dev_reopen-a"],
+                    "side2": ["dev_reopen-b"],
+                    "scores": [[21, 10]],
+                    "scoreAll": [1, 0],
+                    "status": "done",
+                }
+            ],
+        }
+        client.post("/api/races/reopen_race/start", json=start, headers=owner)
+        client.post("/api/races/reopen_race/finish", headers=owner)
+        assert client.post("/api/races/reopen_race/reopen", headers=owner).status_code == 200
+        assert client.get("/api/races/reopen_race", headers=owner).json()["status"] == "playing"
+        # 管理员也允许（重开是纠错通道）；而非创建者普通用户被拒
+
+
+def test_stats_mine_survives_nickname_change():
+    with TestClient(app) as client:
+        admin = login(client, "venue-admin")
+        me = login(client, "st-me-identity")
+        rival = login(client, "st-rival")
+        race(client, admin, "st_race", max_players=8)
+        client.post("/api/races/st_race/join", json={"name": "老张"}, headers=me)
+        client.post("/api/races/st_race/join", json={"name": "小李"}, headers=rival)
+
+        start = {
+            "players": [
+                {"id": "dev_st-me-identity", "name": "老张", "gender": "M", "level": 3},
+                {"id": "dev_st-rival", "name": "小李", "gender": "M", "level": 4},
+            ],
+            "matches": [
+                {
+                    "id": "st_m1",
+                    "round": 1,
+                    "court": 1,
+                    "side1": ["dev_st-me-identity"],
+                    "side2": ["dev_st-rival"],
+                    "scores": [[21, 15]],
+                    "scoreAll": [1, 0],
+                    "status": "done",
+                }
+            ],
+        }
+        client.post("/api/races/st_race/start", json=start, headers=admin)
+
+        before = client.get("/api/stats?mine=true", headers=me).json()
+        assert before["total"]["wins"] == 1
+
+        # 改昵称后按身份仍能查到历史战绩
+        client.put("/api/me", json={"nickname": "改名了"}, headers=me)
+        after = client.get("/api/stats?mine=true", headers=me).json()
+        assert after["total"]["wins"] == 1 and after["total"]["alls"] == 1
+
+        # 按名字查别人也仍然可用
+        other = client.get("/api/stats?name=小李", headers=me).json()
+        assert other["total"]["alls"] == 1
