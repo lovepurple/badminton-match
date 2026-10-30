@@ -236,3 +236,112 @@ def test_stats_mine_survives_nickname_change():
         # 按名字查别人也仍然可用
         other = client.get("/api/stats?name=小李", headers=me).json()
         assert other["total"]["alls"] == 1
+
+
+def test_acquaintances_keep_newest_when_over_20():
+    """球友超过 20 人时，应保留最近同场的人而不是最早的。"""
+    from app import rules
+
+    # list_races_all 按 updated_at DESC：r30 最新
+    races = [{"id": f"r{i}", "status": "done"} for i in range(30, 0, -1)]
+    store = {}
+    for i in range(1, 31):
+        store[f"r{i}"] = [
+            {"user_id": "me", "name": "我", "joined_at": i},
+            # 这里用 joined_at 递增表示越晚同场
+            {"user_id": f"u{i}", "name": f"球友{i}", "gender": "M", "level": 3, "joined_at": i},
+        ]
+
+    people = rules.acquaintances(races, "me", lambda rid: store[rid])
+    assert len(people) == 20
+    names = [p["name"] for p in people]
+    assert "球友30" in names          # 最近同场的必须在
+    assert "球友1" not in names       # 最早的不该挤掉最新的
+    assert names[0] == "球友30"       # 且按最新优先排序
+
+    # 同一人多次同场：取最近一次的档案
+    repeat = {
+        "old": [
+            {"user_id": "me", "joined_at": 1},
+            {"user_id": "dup", "name": "旧名", "gender": "M", "level": 1, "joined_at": 1},
+        ],
+        "new": [
+            {"user_id": "me", "joined_at": 2},
+            {"user_id": "dup", "name": "新名", "gender": "F", "level": 5, "joined_at": 2},
+        ],
+    }
+    got = rules.acquaintances(
+        [{"id": "new", "status": "done"}, {"id": "old", "status": "done"}],
+        "me",
+        lambda rid: repeat[rid],
+    )
+    assert len(got) == 1
+    assert got[0]["name"] == "新名" and got[0]["gender"] == "F" and got[0]["level"] == 5
+
+
+def test_join_info_exposes_signup_deadline():
+    """报名页需要拿到截止时间，否则用户看不到自己何时不能再报名。"""
+    from datetime import datetime, timedelta
+
+    with TestClient(app) as client:
+        admin = login(client, "venue-admin")
+        race(client, admin, "dl_info", max_players=8)
+        future = (datetime.now() + timedelta(days=1)).replace(microsecond=0).isoformat()
+        client.post(
+            "/api/races/dl_info/open",
+            json={"maxPlayers": 8, "deadline": future},
+            headers=admin,
+        )
+        code = client.get("/api/races/dl_info/participants", headers=admin).json()["joinCode"]
+        info = client.get(f"/api/join/{code}", headers=admin).json()
+        assert info["race"]["signupDeadline"], "报名页信息应包含截止时间"
+        assert info["race"]["signupDeadline"].startswith(future[:16])
+
+
+def test_reopen_records_audit_trail():
+    """重开改分会改写已公布的排名，必须留痕（次数 + 时间）。"""
+    with TestClient(app) as client:
+        admin = login(client, "venue-admin")
+        race(client, admin, "reopen_audit", max_players=8)
+        start = {
+            "players": [
+                {"id": "dev_ra-a", "name": "甲", "gender": "M", "level": 1},
+                {"id": "dev_ra-b", "name": "乙", "gender": "M", "level": 2},
+            ],
+            "matches": [
+                {
+                    "id": "ra_m1",
+                    "round": 1,
+                    "court": 1,
+                    "side1": ["dev_ra-a"],
+                    "side2": ["dev_ra-b"],
+                    "scores": [],
+                    "scoreAll": None,
+                    "status": "pending",
+                }
+            ],
+        }
+        client.post("/api/races/reopen_audit/start", json=start, headers=admin)
+        client.post("/api/races/reopen_audit/finish", headers=admin)
+
+        before = client.get("/api/races/reopen_audit/summary", headers=admin).json()
+        assert before["reopenCount"] == 0 and before["reopenedAt"] is None
+
+        res = client.post("/api/races/reopen_audit/reopen", headers=admin).json()
+        assert res["reopened"] == 1
+
+        client.post("/api/races/reopen_audit/finish", headers=admin)
+        after = client.get("/api/races/reopen_audit/summary", headers=admin).json()
+        assert after["reopenCount"] == 1
+        assert after["reopenedAt"] and after["reopenedAt"] > 0
+
+        # 留痕必须真正持久化（不是只存在返回值里）
+        doc = client.get("/api/races/reopen_audit", headers=admin).json()
+        assert len(doc.get("reopenHistory") or []) == 1
+        assert doc["reopenHistory"][0]["by"]
+
+        # 非创建者/管理员看不到审计明细（里面含操作者 user_id）
+        outsider = login(client, "audit-outsider")
+        client.post("/api/races/reopen_audit/join", json={"name": "路人"}, headers=outsider)
+        seen = client.get("/api/races/reopen_audit", headers=outsider).json()
+        assert "reopenHistory" not in seen

@@ -214,21 +214,49 @@ if (!state.avatar) state.avatar = "";
   async function updateRace(race) {
     cache(race);
     try {
-      await authed('/api/races/' + race.id, { method: 'PUT', data: race });
+      const doc = await authed('/api/races/' + race.id, {
+        method: 'PUT',
+        data: race // 带 rev，服务端做乐观锁校验
+      });
+      if (doc && doc.rev != null) {
+        race.rev = doc.rev;
+        cache(race);
+      }
+      return { ok: true, race };
     } catch (e) {
+      // 409 = 别人先改了：不排队重放（会把别人的改动覆盖掉），直接把冲突交给界面
+      if (e && e.status === 409) return { ok: false, conflict: true, detail: e.detail };
       enqueue({ op: 'race.put', race });
+      return { ok: true, race, queued: true };
     }
-    return race;
   }
 
   async function updateMatch(raceId, match) {
     try {
-      await authed('/api/races/' + raceId + '/matches/' + match.id, {
+      const doc = await authed('/api/races/' + raceId + '/matches/' + match.id, {
         method: 'PUT',
-        data: match
+        data: match // 带该场 rev，服务端做 match 级乐观锁校验
       });
+      // 用服务端返回的权威版本号更新本场
+      if (doc && Array.isArray(doc.matches)) {
+        const fresh = doc.matches.find(m => m.id === match.id);
+        if (fresh && fresh.rev != null) match.rev = fresh.rev;
+        if (doc.rev != null) {
+          const local = getRace(raceId);
+          if (local) {
+            local.rev = doc.rev;
+            save();
+          }
+        }
+      }
+      return { ok: true };
     } catch (e) {
+      if (e && e.status === 409) {
+        // 同场被他人改过：不重放（否则覆盖对方比分），交给界面刷新
+        return { ok: false, conflict: true, detail: e.detail };
+      }
       enqueue({ op: 'match.put', raceId, match });
+      return { ok: true, queued: true };
     }
   }
 

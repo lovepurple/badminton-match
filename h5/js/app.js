@@ -69,6 +69,21 @@
     document.getElementById('modal').hidden = true;
   }
 
+  /* 乐观锁冲突：提示并拉取服务端最新版本，避免用户对着旧比分继续操作 */
+  async function handleConflict(raceId, result) {
+    modal((result && result.detail) || '有人先你一步改了比分，已为你刷新，请确认后重新操作。', [
+      {
+        label: '刷新看最新',
+        primary: true,
+        fn: async () => {
+          await S.pull();
+          if (raceId) route();
+        }
+      }
+    ]);
+    return false;
+  }
+
   function askText(title, value, placeholder) {
     return new Promise(resolve => {
       let settled = false;
@@ -283,6 +298,24 @@
     if (!value) return '';
     const text = String(value).replace("T", " ");
     return text.length > 16 ? text.slice(0, 16) : text;
+  }
+
+  /* 报名截止是否已过（deadline 由服务端下发 ISO 串） */
+  function deadlinePassed(deadline) {
+    if (!deadline) return false;
+    const t = new Date(deadline).getTime();
+    if (isNaN(t)) return false;
+    return Date.now() > t;
+  }
+
+  /* 截止时间按本地时区显示：服务端存的是 UTC ISO，直接截断会差 8 小时 */
+  function formatDeadline(value) {
+    if (!value) return '';
+    const d = new Date(value);
+    if (isNaN(d.getTime())) return formatDate(value);
+    const pad = n => (n < 10 ? '0' + n : String(n));
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+      ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
   }
 
   function venueLine(venue) {
@@ -664,7 +697,8 @@
                 scores: [],
                 scoreAll: null,
                 crt: [0, 0],
-                status: "pending"
+                status: "pending",
+                rev: 0
               }));
               if (!matches.length) return modal("当前人数无法生成对阵");
               try {
@@ -787,6 +821,11 @@
         .join("");
       const played = (data.matches || []).filter(m => m.scoreAll && m.scores.length);
       box.innerHTML =
+        (data.reopenCount
+          ? '<div class="card"><div class="meta">⚠️ 本场成绩被重开修订过 ' + data.reopenCount + ' 次' +
+            (data.reopenedAt ? '（最后一次：' + esc(formatDeadline(data.reopenedAt)) + '）' : '') +
+            '，以当前排名为准。</div></div>'
+          : '') +
         '<div class="card"><h3>最终排名</h3>' +
         '<table class="rank-table"><thead><tr><th>#</th>' +
         '<th style="text-align:left">' + (data.ranking.kind === "team" ? "队伍" : "选手") + "</th>" +
@@ -810,7 +849,7 @@
 
   /* ---------------- 报名页 ---------------- */
 
-  async function fillFriends() {
+  async function fillFriends(onPick) {
     const box = document.getElementById("j-friends");
     if (!box) return;
     let people = [];
@@ -839,6 +878,8 @@
           name.value = p.name;
           name.dispatchEvent(new Event("input", { bubbles: true }));
         }
+        // 高亮按钮只是视觉；真实值必须回写给 renderJoin 里的 gender 变量
+        if (onPick) onPick(p);
         document.querySelectorAll("[data-gender]").forEach(b => {
           b.classList.toggle("on", b.dataset.gender === (p.gender || "M"));
         });
@@ -874,7 +915,13 @@
         : "") +
       '<div class="meta" style="margin-top:4px">' +
       (race.maxPlayers ? "限 " + race.maxPlayers + " 人" : "不限人数") + " · 已报名 " +
-      info.participants.length + " 人</div></div>";
+      info.participants.length + " 人</div>" +
+      (race.signupDeadline
+        ? '<div class="meta">' + (deadlinePassed(race.signupDeadline)
+            ? '<span class="badge">报名已截止</span>'
+            : "报名截止：" + esc(formatDeadline(race.signupDeadline))) + "</div>"
+        : "") +
+      "</div>";
 
     if (status !== "open") {
       html += '<div class="card"><div class="meta">' +
@@ -965,7 +1012,9 @@
       };
     });
 
-    fillFriends();
+    fillFriends(p => {
+      gender = p.gender || "M";
+    });
 
     document.getElementById("join").onclick = async () => {
       const name = document.getElementById("jname").value.trim();
@@ -1094,9 +1143,11 @@
         scores: [],
         scoreAll: null,
         crt: [0, 0],
-        status: 'pending'
+        status: 'pending',
+        rev: 0
       });
-      await S.updateRace(race);
+      const r = await S.updateRace(race);
+      if (r && r.conflict) return handleConflict(race.id, r);
       route();
     };
     pick();
@@ -1178,7 +1229,8 @@
     if (undoBtn) {
       undoBtn.onclick = async () => {
         if (!undoScore(race, match)) return modal("没有可撤销的操作");
-        await S.updateMatch(race.id, match);
+        const r = await S.updateMatch(race.id, match);
+        if (r && r.conflict) return handleConflict(race.id, r);
         renderMatch(race, mid);
       };
     }
@@ -1209,7 +1261,8 @@
               match.scoreAll = null;
               match.status = 'pending';
               match.crt = chase ? chaseBase(race, match) : [0, 0];
-              await S.updateMatch(race.id, match);
+              const r = await S.updateMatch(race.id, match);
+              if (r && r.conflict) return handleConflict(race.id, r);
               renderMatch(race, mid);
             }
           }
@@ -1274,7 +1327,8 @@
           primary: true,
           fn: async () => {
             match.status = 'done';
-            await S.updateMatch(race.id, match);
+            const r = await S.updateMatch(race.id, match);
+            if (r && r.conflict) return handleConflict(race.id, r);
             go('#/race/' + race.id);
           }
         }
@@ -1282,7 +1336,8 @@
       renderMatch(race, match.id);
       return;
     }
-    await S.updateMatch(race.id, match);
+    const r = await S.updateMatch(race.id, match);
+    if (r && r.conflict) return handleConflict(race.id, r);
     renderMatch(race, match.id);
   }
 
@@ -1297,7 +1352,8 @@
     match.scores = [delta];
     match.scoreAll = delta[0] > delta[1] ? [1, 0] : [0, 1];
     match.status = 'done';
-    await S.updateMatch(race.id, match);
+    const r = await S.updateMatch(race.id, match);
+    if (r && r.conflict) return handleConflict(race.id, r);
     go('#/race/' + race.id);
   }
 
@@ -1834,7 +1890,8 @@
       scores: [],
       scoreAll: null,
       crt: [0, 0],
-      status: 'pending'
+      status: 'pending',
+      rev: 0
     }));
 
     await S.createRace(race);
@@ -1934,7 +1991,7 @@
       '</div>';
 
     view.querySelector('#search-other').onclick = () => {
-      modal('输入要查的名字', [{ label: '取消' }], {
+      modal('输入要查的名字', [{ label: '取消' }, { label: '查询', primary: true }], {
         input: { value: who, placeholder: '选手昵称' },
         onConfirm: name => {
           if (!name) return;

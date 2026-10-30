@@ -12,6 +12,14 @@ import time
 DEFAULT_DB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data.db")
 
 
+class RaceConflict(Exception):
+    """乐观锁冲突：文档版本已落后，拒绝覆盖。携带当前版本号。"""
+
+    def __init__(self, current_rev: int):
+        self.current_rev = current_rev
+        super().__init__(f"文档已更新到 rev={current_rev}，请刷新后重试")
+
+
 def db_path() -> str:
     return os.environ.get("GORILLA_DB", DEFAULT_DB)
 
@@ -52,7 +60,8 @@ CREATE TABLE IF NOT EXISTS races (
     updated_at    INTEGER NOT NULL,
     join_code     TEXT,
     status        TEXT NOT NULL DEFAULT 'draft',
-    max_players   INTEGER NOT NULL DEFAULT 0
+    max_players   INTEGER NOT NULL DEFAULT 0,
+    rev           INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_races_owner ON races(owner_id, updated_at DESC);
@@ -108,6 +117,7 @@ COLUMNS = [
     ("races", "join_code", "TEXT"),
     ("races", "status", "TEXT NOT NULL DEFAULT 'draft'"),
     ("races", "max_players", "INTEGER NOT NULL DEFAULT 0"),
+    ("races", "rev", "INTEGER NOT NULL DEFAULT 0"),
     ("users", "role", "TEXT NOT NULL DEFAULT 'user'"),
     ("users", "avatar", "TEXT"),
     ("participants", "avatar", "TEXT"),
@@ -222,7 +232,12 @@ def user_by_token(token: str) -> str | None:
 # ---- races ----------------------------------------------------------------
 
 def race_row_to_doc(row: sqlite3.Row) -> dict:
-    return json.loads(row["data"])
+    """解码比赛文档，并剥掉内部字段（_ownerId/_updatedAt 等）。
+
+    历史版本曾把内部字段写进 data 列，这里统一净化，避免流到外部消费方。
+    """
+    doc = json.loads(row["data"]) if row["data"] else {}
+    return {k: v for k, v in doc.items() if not k.startswith("_")}
 
 
 def list_races(user_id: str) -> list[dict]:
@@ -267,17 +282,38 @@ def get_race(race_id: str) -> dict | None:
     doc = race_row_to_doc(row)
     doc["_ownerId"] = row["owner_id"]
     doc["_updatedAt"] = row["updated_at"]
+    doc["rev"] = row["rev"] if "rev" in row.keys() else 0
     return doc
 
 
-def save_race(owner_id: str, race: dict) -> dict:
+def save_race(owner_id: str, race: dict, expect_rev: int | None = None) -> dict:
+    """保存比赛文档。
+
+    expect_rev 不为 None 时做乐观锁校验：库里当前 rev 必须等于 expect_rev，
+    否则抛 RaceConflict（调用方转 409），避免后写者覆盖先写者（丢更新）。
+
+    BEGIN IMMEDIATE 让「读当前 rev → 写」成为原子操作：并发提交只有一个能
+    通过校验，防止同时读到相同 rev 后双双写入。
+    """
     race_id = race["id"]
     stamp = now()
-    payload = json.dumps(race, ensure_ascii=False, separators=(",", ":"))
-    with connect() as conn:
+    # 落地前剥掉内部字段（_ownerId/_updatedAt 等）与协议字段 rev（rev 存独立列）
+    stored = {
+        k: v for k, v in race.items() if not k.startswith("_") and k != "rev"
+    }
+    payload = json.dumps(stored, ensure_ascii=False, separators=(",", ":"))
+    conn = connect()
+    conn.isolation_level = None  # 手动控制事务，BEGIN IMMEDIATE 卡写锁
+    try:
+        conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute(
-            "SELECT created_at, join_code, status, max_players FROM races WHERE id=?", (race_id,)
+            "SELECT created_at, join_code, status, max_players, rev FROM races WHERE id=?",
+            (race_id,),
         ).fetchone()
+        current_rev = existing["rev"] if existing else 0
+        if expect_rev is not None and existing is not None and expect_rev != current_rev:
+            raise RaceConflict(current_rev)
+        new_rev = current_rev + 1
         created = existing["created_at"] if existing else stamp
         join_code = race.get("joinCode") or (existing["join_code"] if existing else None)
         status = race.get("status") or (existing["status"] if existing else "draft")
@@ -287,15 +323,15 @@ def save_race(owner_id: str, race: dict) -> dict:
         conn.execute(
             "INSERT INTO races(id, owner_id, name, mode, group_name, rounds, balls,"
             " players_count, matches_count, data, created_at, updated_at,"
-            " join_code, status, max_players)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " join_code, status, max_players, rev)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(id) DO UPDATE SET"
             " name=excluded.name, mode=excluded.mode, group_name=excluded.group_name,"
             " rounds=excluded.rounds, balls=excluded.balls,"
             " players_count=excluded.players_count, matches_count=excluded.matches_count,"
             " data=excluded.data, updated_at=excluded.updated_at,"
             " join_code=excluded.join_code, status=excluded.status,"
-            " max_players=excluded.max_players",
+            " max_players=excluded.max_players, rev=excluded.rev",
             (
                 race_id,
                 owner_id,
@@ -312,14 +348,72 @@ def save_race(owner_id: str, race: dict) -> dict:
                 join_code,
                 status,
                 int(max_players or 0),
+                new_rev,
             ),
         )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     race["_ownerId"] = owner_id
     race["_updatedAt"] = stamp
+    race["rev"] = new_rev
     race["status"] = status
     race["joinCode"] = join_code
     race["maxPlayers"] = int(max_players or 0)
     return race
+
+
+def save_match(owner_id: str, race_id: str, match: dict, expect_match_rev: int | None = None) -> dict | None:
+    """原子提交单个对阵比分，match 级乐观锁。
+
+    只替换指定 match（其余场次原样保留），并发记分时：
+    - 不同场次互不冲突（各改各的）；
+    - 同一场次后写者因 match rev 落后抛 RaceConflict，避免丢更新。
+
+    返回保存后的完整比赛文档；match 不存在返回 None（调用方转 404）。
+    """
+    stamp = now()
+    conn = connect()
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT data, rev FROM races WHERE id=?", (race_id,)).fetchone()
+        if not row:
+            return None
+        doc = json.loads(row["data"]) if row["data"] else {}
+        matches = doc.get("matches") or []
+        idx = next((i for i, m in enumerate(matches) if m.get("id") == match.get("id")), None)
+        if idx is None:
+            return None
+        current_mrev = matches[idx].get("rev") or 0
+        if expect_match_rev is not None and expect_match_rev != current_mrev:
+            conn.rollback()
+            raise RaceConflict(current_mrev)
+        new_mrev = current_mrev + 1
+        match["rev"] = new_mrev
+        matches[idx] = match
+        doc["matches"] = matches
+        new_rev = (row["rev"] or 0) + 1
+        stored = {k: v for k, v in doc.items() if not k.startswith("_") and k != "rev"}
+        payload = json.dumps(stored, ensure_ascii=False, separators=(",", ":"))
+        conn.execute(
+            "UPDATE races SET data=?, updated_at=?, matches_count=?, rev=? WHERE id=?",
+            (payload, stamp, len(matches), new_rev, race_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    # 与 get_race 形状一致：挂权威字段后返回
+    doc["_ownerId"] = owner_id
+    doc["_updatedAt"] = stamp
+    doc["rev"] = new_rev
+    return doc
 
 
 def get_race_by_code(code: str) -> dict | None:
@@ -330,6 +424,7 @@ def get_race_by_code(code: str) -> dict | None:
     doc = race_row_to_doc(row)
     doc["_ownerId"] = row["owner_id"]
     doc["_updatedAt"] = row["updated_at"]
+    doc["rev"] = row["rev"] if "rev" in row.keys() else 0
     return doc
 
 
@@ -441,6 +536,7 @@ def list_races_all() -> list[dict]:
         doc = race_row_to_doc(row)
         doc["_ownerId"] = row["owner_id"]
         doc["_updatedAt"] = row["updated_at"]
+        doc["rev"] = row["rev"] if "rev" in row.keys() else 0
         doc["status"] = row["status"]
         docs.append(doc)
     return docs

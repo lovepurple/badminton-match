@@ -94,6 +94,8 @@ class Match(BaseModel):
     scores: list[list[int]] = Field(default_factory=list)
     scoreAll: list[int] | None = None
     status: str = "pending"
+    # 乐观锁：提交校验用，来自客户端看到的比赛 rev
+    rev: int | None = None
 
 
 class AdminClaimIn(BaseModel):
@@ -510,6 +512,7 @@ def join_info(code: str, user_id: str = Depends(current_user)) -> dict:
             "balls": race.get("balls"),
             "status": race.get("status"),
             "maxPlayers": race.get("maxPlayers") or 0,
+            "signupDeadline": race.get("signupDeadline"),
             "date": race.get("date"),
             "venue": race.get("venue"),
             "venueId": race.get("venueId"),
@@ -547,7 +550,13 @@ def start_race(race_id: str, body: StartIn, user_id: str = Depends(current_user)
     if not body.players or not body.matches:
         raise HTTPException(status_code=400, detail="缺少选手或对阵")
     race["players"] = [p.model_dump() for p in body.players]
-    race["matches"] = [m.model_dump() for m in body.matches]
+    # 每场对阵都要有 rev 基线，否则客户端首次记分时无法做乐观锁校验
+    race["matches"] = []
+    for m in body.matches:
+        doc_m = m.model_dump()
+        if doc_m.get("rev") is None:
+            doc_m["rev"] = 0
+        race["matches"].append(doc_m)
     race["status"] = "playing"
     return _race_for_view(db.save_race(user_id, race))
 
@@ -616,12 +625,18 @@ def summary(race_id: str, user_id: str = Depends(current_user)) -> dict:
         "ranking": result,
         "matches": race.get("matches") or [],
         "finishedAt": race.get("_updatedAt") if race.get("status") == "done" else None,
+        # 成绩被重开改过的次数与最后一次时间（前端提示「本场成绩有修订」）
+        "reopenCount": len(race.get("reopenHistory") or []),
+        "reopenedAt": (race.get("reopenHistory") or [{}])[-1].get("at"),
     }
 
 
 def _to_view(race: dict, user_id: str) -> dict:
     """对外视图：去掉内部字段；非创建者/管理员不暴露 _ownerId；访客隐藏对阵与比分。"""
     doc = _race_for_view(race)  # 去掉 _ownerId / _updatedAt
+    # 重开审计明细含操作者 user_id，只给创建者/管理员
+    if not (user_id == race.get("_ownerId") or _is_admin(user_id)):
+        doc.pop("reopenHistory", None)
     if _is_admin(user_id) or can_view_scores(race, user_id):
         if user_id == race.get("_ownerId") or _is_admin(user_id):
             doc["_mine"] = True
@@ -655,7 +670,22 @@ def put_race(race_id: str, race: RaceIn, user_id: str = Depends(current_user)) -
         raise HTTPException(status_code=403, detail="只有创建者可以修改")
     doc = race.model_dump()
     doc["id"] = race_id
-    return db.save_race(user_id, doc)
+    if existing:
+        # 乐观锁：客户端必须携带它看到的 rev，落后则拒绝（防并发覆盖丢更新）
+        body_rev = doc.get("rev")
+        if body_rev is not None and body_rev != existing.get("rev"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"比赛已被其他人修改（rev {body_rev} → {existing.get('rev')}），请刷新后再试",
+            )
+        # 状态机护栏：不允许把已结束/进行中的比赛回滚成未开始（防离线队列重放旧文档）
+        cur, want = existing.get("status"), doc.get("status")
+        if cur in ("playing", "done") and want in ("draft", "open", None):
+            raise HTTPException(status_code=409, detail=f"比赛已{ ('结束' if cur=='done' else '进行中') }，不能回退状态")
+    try:
+        return db.save_race(user_id, doc, expect_rev=existing.get("rev") if existing else None)
+    except db.RaceConflict as e:
+        raise HTTPException(status_code=409, detail=f"比赛已被其他人修改（rev {e.current_rev}），请刷新后再试")
 
 
 @app.delete("/api/races/{race_id}")
@@ -674,14 +704,20 @@ def put_match(
         raise HTTPException(status_code=404, detail="比赛不存在")
     if race.get("_ownerId") != user_id:
         raise HTTPException(status_code=403, detail="只有创建者可以记分")
-    matches = race.get("matches") or []
-    for i, m in enumerate(matches):
-        if m.get("id") == match_id:
-            matches[i] = match.model_dump()
-            break
-    else:
+    payload = match.model_dump()
+    payload["id"] = match_id
+    # match 级乐观锁：同场并发记分只有一次成功；不同场次互不干扰
+    expect = match.rev  # 客户端带上它看到的该场 rev
+    try:
+        saved = db.save_match(user_id, race_id, payload, expect_match_rev=expect)
+    except db.RaceConflict as e:
+        raise HTTPException(
+            status_code=409,
+            detail=f"这场的比分已被别人改过（当前 rev {e.current_rev}），刷新后再记",
+        )
+    if saved is None:
         raise HTTPException(status_code=404, detail="对阵不存在")
-    return db.save_race(user_id, race)
+    return saved
 
 
 @app.get("/api/races/{race_id}/rank")
@@ -904,9 +940,15 @@ def reopen_race(race_id: str, user_id: str = Depends(current_user)) -> dict:
         raise HTTPException(status_code=403, detail="只有创建者可以重新打开")
     if race.get("status") != "done":
         raise HTTPException(status_code=409, detail="只有已结束的比赛可以重新打开")
+    # 留痕：已公布的排名被改写，事后要能追溯谁在什么时候重开了几次。
+    # 注意用非 _ 前缀：save_race 会剥掉所有 _ 开头字段，这里必须能持久化。
+    # 对外视图只给创建者/管理员看，见 _to_view。
+    history = race.get("reopenHistory") or []
+    history.append({"at": int(time.time() * 1000), "by": user_id})
+    race["reopenHistory"] = history[-20:]
     race["status"] = "playing"
     db.save_race(race.get("_ownerId") or user_id, race)
-    return {"ok": True, "status": "playing"}
+    return {"ok": True, "status": "playing", "reopened": len(race["reopenHistory"])}
 
 
 @app.get("/api/people")

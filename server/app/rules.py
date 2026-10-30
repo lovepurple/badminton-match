@@ -331,27 +331,32 @@ def person_stats(races: list[dict], participants_fn) -> list[dict]:
 def acquaintances(races: list[dict], user_id: str, participants_fn) -> list[dict]:
     """当前用户报名过的比赛里，别的参赛者的最新档案（一键选球友）。
 
-    participants_fn(race_id) -> participants。去重取最新一次报名资料，最多 20 人。
+    participants_fn(race_id) -> participants（按 joined_at 升序）。
+    每人取「最近一次同场」的报名资料，按该时间倒序，最多返回 20 人。
     """
-    seen: dict[str, dict] = {}
-    ordered: list[str] = []
+    latest: dict[str, tuple[int, dict]] = {}
     for race in races:
         if race.get("status") == "draft":
             continue
         parts = participants_fn(race["id"])
-        mine = any(p["user_id"] == user_id for p in parts)
-        if not mine:
+        if not any(p["user_id"] == user_id for p in parts):
             continue
         for p in parts:
             if p["user_id"] == user_id:
                 continue
-            if p["user_id"] not in seen:
-                seen[p["user_id"]] = {
-                    "id": p["user_id"],
-                    "name": p.get("name") or "",
-                    "avatar": p.get("avatar"),
-                    "gender": p.get("gender") or "M",
-                    "level": p.get("level") or 0,
-                }
-                ordered.append(p["user_id"])
-    return [seen[uid] for uid in ordered[-20:]]
+            stamp = p.get("joined_at") or 0
+            prev = latest.get(p["user_id"])
+            # 同一人多次同场：保留最近一次的报名资料（姓名/性别/等级可能改过）
+            if prev is None or stamp >= prev[0]:
+                latest[p["user_id"]] = (
+                    stamp,
+                    {
+                        "id": p["user_id"],
+                        "name": p.get("name") or "",
+                        "avatar": p.get("avatar"),
+                        "gender": p.get("gender") or "M",
+                        "level": p.get("level") or 0,
+                    },
+                )
+    ordered = sorted(latest.values(), key=lambda item: -item[0])
+    return [doc for _, doc in ordered[:20]]

@@ -453,4 +453,38 @@ test("个人战绩按名字统计", () => {
   assert.strictEqual(s.rounds, 4);
 });
 
+test("个人战绩按 userId 统计（改昵称不丢历史）", () => {
+  const races = [
+    {
+      mode: "loop",
+      partnerMode: "fixed",
+      players: [
+        { id: "u1", name: "老张" },
+        { id: "u2", name: "小李" },
+      ],
+      matches: [
+        {
+          side1: ["u1"],
+          side2: ["u2"],
+          scores: [[21, 15]],
+          scoreAll: [1, 0],
+        },
+      ],
+    },
+  ];
+  // 按 userId 匹配：即使名字完全对不上也能统计到
+  const byId = ranking.personalStats(races, "改过的昵称", "u1");
+  assert.strictEqual(byId.total.alls, 1);
+  assert.strictEqual(byId.total.wins, 1);
+  assert.strictEqual(byId.userId, "u1");
+
+  // 名字对不上且不给 userId：统计不到
+  const miss = ranking.personalStats(races, "改过的昵称");
+  assert.strictEqual(miss.total.alls, 0);
+
+  // 旧用法（只给名字）仍然可用
+  const byName = ranking.personalStats(races, "老张");
+  assert.strictEqual(byName.total.wins, 1);
+});
+
 console.log("\n" + passed + " passed");

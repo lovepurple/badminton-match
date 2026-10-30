@@ -225,8 +225,12 @@
     };
   }
 
-  /* 个人战绩：跨比赛统计某名字的场次/胜率 */
-  function personalStats(races, name) {
+  /* 个人战绩：跨比赛统计某人的场次/胜率
+   *
+   * 与 server/app/rules.py 的 personal_stats 保持一致：
+   * 优先按 userId 匹配（报名即身份，选手 id 就是用户 id），没有再回退按名字匹配，
+   * 这样改昵称后历史战绩不会丢。 */
+  function personalStats(races, name, userId) {
     var out = {
       total: {
         alls: 0,
@@ -257,8 +261,9 @@
         var ids = m.side1.concat(m.side2);
         var mine = -1;
         (race.players || []).forEach(function (p) {
-          if (p.name === name && ids.indexOf(p.id) >= 0)
-            mine = m.side1.indexOf(p.id) >= 0 ? 0 : 1;
+          if (ids.indexOf(p.id) < 0) return;
+          var hit = (userId && p.id === userId) || (name && p.name === name);
+          if (hit) mine = m.side1.indexOf(p.id) >= 0 ? 0 : 1;
         });
         if (mine < 0) return;
         var bucket = singles ? out.singles : out.doubles;
@@ -283,6 +288,8 @@
         out.rounds += (m.scores || []).length;
       });
     });
+    out.name = name || "";
+    out.userId = userId || null;
     return out;
   }
 

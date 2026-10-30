@@ -29,9 +29,9 @@ Base：`http://<host>:18000`（端口可改）。除 `POST /api/auth/login` 与 
 | GET | `/api/races?full=1` | 返回完整文档（含 players/teams/matches），客户端同步用 |
 | POST | `/api/races` | 新建比赛（整份文档） |
 | GET | `/api/races/{id}` | 读取比赛（任何登录用户可读，便于朋友围观） |
-| PUT | `/api/races/{id}` | 覆盖整份文档（仅创建者） |
+| PUT | `/api/races/{id}` | 覆盖整份文档（仅创建者）。带 `rev` 做乐观锁：落后返回 409；不允许把 playing/done 回退成 draft/open |
 | DELETE | `/api/races/{id}` | 删除（仅创建者） |
-| PUT | `/api/races/{id}/matches/{mid}` | 提交单个对阵的比分（仅创建者） |
+| PUT | `/api/races/{id}/matches/{mid}` | 提交单个对阵的比分（仅创建者）。match 带自身 `rev`：同场并发只有一个成功，另一个 409；不同场互不影响 |
 | GET | `/api/races/{id}/rank` | 服务端计算排名 |
 
 比赛文档字段与客户端 `race` 一致：
@@ -53,8 +53,9 @@ Base：`http://<host>:18000`（端口可改）。除 `POST /api/auth/login` 与 
   "groupsValid": 3,
   "players": [{ "id": "p1", "name": "阿豪", "gender": "M", "level": 3 }],
   "teams": [{ "name": "A 队", "players": ["p1", "p2"] }],
+  "rev": 7,
   "matches": [{
-    "id": "m1", "round": 1, "court": 1,
+    "id": "m1", "round": 1, "court": 1, "rev": 2,
     "side1": ["p1", "p2"], "side2": ["p3", "p4"],
     "scores": [[21, 19], [21, 15]],
     "scoreAll": [2, 0],
@@ -97,9 +98,9 @@ Base：`http://<host>:18000`（端口可改）。除 `POST /api/auth/login` 与 
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/races/{id}/open` | 开放报名，body `{"maxPlayers": 8}`（0 = 不限），返回 `joinCode` |
-| GET | `/api/join/{code}` | 报名页信息：比赛摘要 + 报名名单 + 是否已报名 |
-| POST | `/api/races/{id}/join` | 报名，body `{"name","gender","level"}`；已满/非报名阶段返回 409 |
+| POST | `/api/races/{id}/open` | 开放报名，body `{"maxPlayers": 8, "deadline": "2026-11-01T12:00:00.000Z"}`（0 = 不限，`deadline` 可空 = 不截止），返回 `joinCode` |
+| GET | `/api/join/{code}` | 报名页信息：比赛摘要（含 `signupDeadline`）+ 报名名单 + 是否已报名 |
+| POST | `/api/races/{id}/join` | 报名，body `{"name","gender","level"}`；已满/非报名阶段/已过截止时间返回 409 |
 | DELETE | `/api/races/{id}/join` | 退出报名（进行中不可退） |
 | GET | `/api/races/{id}/participants` | 报名名单 + `isOwner` + `status` + `joinCode` |
 | POST | `/api/races/{id}/start` | 开始比赛，body `{"players":[...],"matches":[...]}`（对阵由客户端生成） |
@@ -108,11 +109,11 @@ Base：`http://<host>:18000`（端口可改）。除 `POST /api/auth/login` 与 
 | POST | `/api/races/{id}/waitlist` | 满员时进入候补队列 |
 | DELETE | `/api/races/{id}/participants/{uid}` | 移出成员（创建者/管理员），自动递补候补第一个 |
 | GET/POST/DELETE | `/api/presets` | 常用模板（每人私有） |
-| GET | `/api/acquaintances` | 以往同场的球友（一键选人） |
-| POST | `/api/races/{id}/reopen` | 重新打开已结束的比赛以改分 |
+| GET | `/api/acquaintances` | 以往同场的球友：每人取最近一次报名资料，按最近同场倒序，最多 20 人 |
+| POST | `/api/races/{id}/reopen` | 重新打开已结束的比赛以改分（创建者/管理员）；写入 `reopenHistory` 留痕 |
 | GET | `/api/stats?mine=true` | 按登录身份统计战绩（改昵称不丢） |
 | GET | `/api/races/{id}/live?since=<updatedAt>` | 实时轮询（创建者/成员/管理员）；访客 403 |
-| GET | `/api/races/{id}/summary` | 汇总：最终排名 + 全部对阵 |
+| GET | `/api/races/{id}/summary` | 汇总：最终排名 + 全部对阵 + `reopenCount`/`reopenedAt`（成绩被重开修订过几次） |
 
 `GET /api/races` 返回「自己创建的 + 自己报名过的」比赛，摘要里带 `status`、`joinCode`、`maxPlayers`、`mine`。
 
